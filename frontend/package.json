@@ -1,0 +1,23 @@
+{
+  "name": "geo-studio-3d-frontend",
+  "version": "2.0.0",
+  "private": true,
+  "description": "亿级测绘点云、动态三角网编辑与多级放坡土方三维交互前端",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 1420 --strictPort",
+    "build": "tsc && vite build",
+    "preview": "vite preview --port 1420"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.0",
+    "@tauri-apps/plugin-dialog": "^2.0.3",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.170.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}
+

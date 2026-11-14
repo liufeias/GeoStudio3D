@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoStudio 3D — 亿级点云三角网与土方放坡工程系统</title>
+  <link rel="stylesheet" href="/src/styles/app.css" />
+</head>
+<body>
+  <div id="app-root">
+    <!-- 顶部工程工具栏 -->
+    <header class="top-toolbar">
+      <div class="brand-area">
+        <span class="brand-badge">GEO KERNEL v2.0</span>
+        <h1 class="brand-title">三维测绘点云与土方放坡设计系统</h1>
+      </div>
+
+      <div class="toolbar-actions">
+        <button id="btn-import-p1" class="btn btn-primary" title="导入第一期原始地面 .dat 点云">
+          导入第一期原地面 (.dat)
+        </button>
+        <button id="btn-import-p2" class="btn btn-secondary" title="导入第二期竣工/目标面 .dat 点云">
+          导入第二期目标面 (.dat)
+        </button>
+        <span class="toolbar-divider"></span>
+        <button id="btn-undo" class="btn btn-icon" disabled title="撤销三角网拓扑编辑 (Ctrl+Z)">
+          撤销
+        </button>
+        <button id="btn-redo" class="btn btn-icon" disabled title="重做三角网拓扑编辑 (Ctrl+Y)">
+          重做
+        </button>
+        <span class="toolbar-divider"></span>
+        <button id="btn-reset-camera" class="btn btn-secondary" title="俯视全图居中显示">
+          全图居中
+        </button>
+      </div>
+    </header>
+
+    <!-- 主工作区：左侧图层与显示控制 + 中央 3D 视口 + 右侧工程算量与放坡参数面板 -->
+    <main class="workspace-body">
+      <!-- 左侧面板：图层开关、着色器模式、三角网交互编辑工具 -->
+      <aside class="side-panel left-panel">
+        <section class="panel-card">
+          <h2 class="card-title">图层与可见性管理</h2>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-layer-octree" checked />
+            <span>第一期点云八叉树 (LOD)</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-layer-tin1" checked />
+            <span>第一期原地面三角网 (TIN)</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-layer-tin2" checked />
+            <span>第二期目标面三角网 (TIN)</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-layer-grading" checked />
+            <span>多级放坡设计面网格</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-layer-merged" />
+            <span>缝合后完整设计地形</span>
+          </label>
+        </section>
+
+        <section class="panel-card">
+          <h2 class="card-title">三维渲染着色模式</h2>
+          <div class="form-group">
+            <label for="sel-tin-shader">三角网设色方案</label>
+            <select id="sel-tin-shader" class="form-control">
+              <option value="0">高程分层设色 + 动态等高线</option>
+              <option value="1">地形坡度热力分析 (0° ~ 60°)</option>
+              <option value="2">放坡工程分区设色 (平台/坡面/马道)</option>
+              <option value="3">单色工程线框光照模式</option>
+            </select>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-tin-wireframe" />
+            <span>叠加显示三角网拓扑格网线</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-edl-enable" checked />
+            <span>开启点云眼罩光照 (EDL 立体增强)</span>
+          </label>
+          <div class="form-group">
+            <label for="rng-point-budget">点云单帧预算: <strong id="lbl-point-budget">800 万点</strong></label>
+            <input type="range" id="rng-point-budget" min="1000000" max="20000000" step="1000000" value="8000000" />
+          </div>
+          <div class="form-group">
+            <label for="num-tin-decimate">构网抽稀网格步长 (米, 0=全量)</label>
+            <input type="number" id="num-tin-decimate" class="form-control" value="0.5" min="0" max="50" step="0.1" />
+          </div>
+        </section>
+
+        <section class="panel-card">
+          <h2 class="card-title">三角网交互式拓扑编辑</h2>
+          <div class="tool-grid">
+            <button class="tool-btn active" data-tool="orbit">浏览/拾取</button>
+            <button class="tool-btn" data-tool="flip-edge">对角线翻转</button>
+            <button class="tool-btn" data-tool="edit-z">修改点高程</button>
+            <button class="tool-btn" data-tool="insert-pt">插入新测点</button>
+            <button class="tool-btn" data-tool="breakline">绘制特征线</button>
+            <button class="tool-btn" data-tool="clip-poly">多边形裁剪</button>
+          </div>
+          <p id="lbl-tool-hint" class="hint-text">
+            当前模式：自由旋转/平移/缩放视口，左键点击查询三角网精确坐标与高程。
+          </p>
+          <div class="inline-actions" id="poly-edit-actions" style="display: none;">
+            <button id="btn-commit-poly" class="btn btn-primary btn-sm">完成并嵌入</button>
+            <button id="btn-cancel-poly" class="btn btn-secondary btn-sm">取消绘制</button>
+          </div>
+        </section>
+      </aside>
+
+      <!-- 中央 WebGL2 / Three.js 三维主视口 -->
+      <section class="viewport-container">
+        <canvas id="gl-canvas"></canvas>
+
+        <!-- 左上角实时渲染性能与数据统计 HUD -->
+        <div class="hud-overlay hud-top-left">
+          <div>FPS: <span id="hud-fps">60</span> | 可视点数: <span id="hud-vis-pts">0</span></div>
+          <div>TIN 三角形: <span id="hud-tin-tris">0</span> | 显存瓦片: <span id="hud-gpu-tiles">0</span></div>
+          <div>RTC 原点: <span id="hud-rtc-origin">未加载</span></div>
+        </div>
+
+        <!-- 底部状态栏与光标实时大地坐标读数 -->
+        <div class="hud-overlay hud-bottom-bar">
+          <span id="hud-cursor-coord">大地坐标: E = ---, N = ---, H = ---</span>
+          <span id="hud-status-msg">内核就绪，请导入测绘 .dat 点云文件</span>
+        </div>
+      </section>
+
+      <!-- 右侧面板：两期土方算量 + 向内/向外多级放坡建模 -->
+      <aside class="side-panel right-panel">
+        <section class="panel-card">
+          <h2 class="card-title">两期三角网土方算量</h2>
+          <p class="hint-text">基于精确三棱柱布尔叠加法（自动剖分零填挖等值线）。</p>
+          <div class="inline-actions">
+            <button id="btn-calc-ew-exact" class="btn btn-primary">精确三棱柱算量</button>
+            <button id="btn-calc-ew-grid" class="btn btn-secondary">快速网格估算</button>
+          </div>
+          <div class="result-grid" id="ew-result-box">
+            <div class="result-item"><span>总挖方量:</span><strong id="res-ew-cut">0.00 m³</strong></div>
+            <div class="result-item"><span>总填方量:</span><strong id="res-ew-fill">0.00 m³</strong></div>
+            <div class="result-item"><span>净土方量:</span><strong id="res-ew-net">0.00 m³</strong></div>
+            <div class="result-item"><span>重叠面积:</span><strong id="res-ew-area">0.00 m²</strong></div>
+          </div>
+        </section>
+
+        <section class="panel-card">
+          <h2 class="card-title">向内 / 向外多级放坡设计</h2>
+          <div class="form-row-2">
+            <div class="form-group">
+              <label for="sel-grade-dir">放坡方向</label>
+              <select id="sel-grade-dir" class="form-control">
+                <option value="0">向外放坡 (路基/垫高)</option>
+                <option value="1">向内放坡 (基坑/库盆)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="sel-grade-vmode">垂直模式</label>
+              <select id="sel-grade-vmode" class="form-control">
+                <option value="0">自动判定挖填</option>
+                <option value="-1">强制向下放坡</option>
+                <option value="1">强制向上放坡</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row-2">
+            <div class="form-group">
+              <label for="num-grade-elev">设计平台高程 (大地 H)</label>
+              <input type="number" id="num-grade-elev" class="form-control" value="115.0" step="0.5" />
+            </div>
+            <div class="form-group">
+              <label for="num-grade-step">轮廓加密步长 (m)</label>
+              <input type="number" id="num-grade-step" class="form-control" value="1.5" min="0.2" max="20" step="0.1" />
+            </div>
+          </div>
+
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-grade-daylight" checked />
+            <span>自动与原地面求交生成坡脚线 (Daylighting)</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="chk-grade-stitch" checked />
+            <span>生成与原地面无缝缝合完整地形</span>
+          </label>
+
+          <!-- 多级边坡参数表 -->
+          <div class="stages-header">
+            <span>分级边坡与马道配置</span>
+            <button id="btn-add-stage" class="btn btn-sm btn-secondary">+ 添加一级</button>
+          </div>
+          <div id="grading-stages-list" class="stages-list"></div>
+
+          <div class="inline-actions" style="margin-top: 8px;">
+            <button id="btn-draw-grade-poly" class="btn btn-secondary">框选/绘制设计轮廓</button>
+            <button id="btn-run-grading" class="btn btn-primary">生成放坡与算量</button>
+          </div>
+
+          <div class="result-grid" style="margin-top: 10px;">
+            <div class="result-item"><span>放坡挖方:</span><strong id="res-gr-cut">0.00 m³</strong></div>
+            <div class="result-item"><span>放坡填方:</span><strong id="res-gr-fill">0.00 m³</strong></div>
+            <div class="result-item"><span>坡面斜面积:</span><strong id="res-gr-slope-area">0.00 m²</strong></div>
+            <div class="result-item"><span>马道面积:</span><strong id="res-gr-berm-area">0.00 m²</strong></div>
+            <div class="result-item"><span>坡脚线周长:</span><strong id="res-gr-perim">0.00 m</strong></div>
+            <div class="result-item"><span>相交状态:</span><strong id="res-gr-conv">未计算</strong></div>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+

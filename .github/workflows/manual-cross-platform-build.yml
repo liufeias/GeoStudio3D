@@ -1,0 +1,1091 @@
+# ==============================================================================
+# 文件路径：.github/workflows/manual-cross-platform-build.yml
+# 工作流名称：GeoStudio 3D 跨平台手动构建与全链路诊断流水线
+#
+# 核心设计规范：
+#   1. 严格手动触发（仅 workflow_dispatch）：在 Actions 页面点击 "Run workflow" 启动。
+#   2. 可视化自由勾选构建平台：支持 Windows、Linux、macOS、WebAssembly (WASM) 任意组合。
+#   3. 全链路增量构建缓存（C++20 build/ + npm node_modules/ + Rust target/）：
+#      - 采用 restore + if: always() save 双阶段策略，即使某步构建失败也会保存已编译依赖，
+#        二次重跑无需重复下载和编译数百个 Rust/C++ 依赖单元，大幅缩短排查迭代周期。
+#   4. 严格项目路径校验与全阶段日志采集：
+#      - 无论构建成功或失败（if: always()）均强制上传完整诊断日志与 CMake 内部日志包。
+# ==============================================================================
+
+name: Manual Cross-Platform Build & Diagnostics
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_windows:
+        description: "勾选构建 Windows (x86_64 MSVC + GeoKernelCore.dll + 桌面应用)"
+        type: boolean
+        required: true
+        default: true
+      build_linux:
+        description: "勾选构建 Linux (x86_64 GCC/Ninja + libGeoKernelCore.so + 桌面应用)"
+        type: boolean
+        required: true
+        default: true
+      build_macos:
+        description: "勾选构建 macOS (Apple Silicon/x64 Clang + libGeoKernelCore.dylib)"
+        type: boolean
+        required: true
+        default: false
+      build_wasm:
+        description: "勾选构建 WebAssembly (Emscripten WASM 模块 + Web 静态前端)"
+        type: boolean
+        required: true
+        default: false
+      build_scope:
+        description: "构建范围（full-app: C++内核+前端+Tauri桌面应用 | kernel-only: 仅C++20内核与压测）"
+        type: choice
+        required: true
+        default: "full-app"
+        options:
+          - "full-app"
+          - "kernel-only"
+      cmake_build_type:
+        description: "编译优化级别（Release: 生产发布 | RelWithDebInfo: 带符号分析 | Debug: 调试）"
+        type: choice
+        required: true
+        default: "Release"
+        options:
+          - "Release"
+          - "RelWithDebInfo"
+          - "Debug"
+      run_kernel_benchmark:
+        description: "编译后自动运行 GeoKernelBench 端到端算法精度与性能自检"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+
+env:
+  CMAKE_EXPORT_COMPILE_COMMANDS: "ON"
+  CARGO_TERM_COLOR: "always"
+  CARGO_TERM_VERBOSE: "true"
+  RUST_BACKTRACE: "full"
+  FORCE_COLOR: "1"
+
+jobs:
+  # ============================================================================
+  # 阶段 0：严格路径完整性校验与动态多平台构建矩阵生成
+  # ============================================================================
+  prepare-build:
+    name: "0. 校验构建参数、项目路径与生成矩阵"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      native_matrix: ${{ steps.calc-matrix.outputs.native_matrix }}
+      has_native_targets: ${{ steps.calc-matrix.outputs.has_native_targets }}
+      build_scope: ${{ inputs.build_scope }}
+      build_wasm: ${{ inputs.build_wasm }}
+      cmake_build_type: ${{ inputs.cmake_build_type }}
+      run_kernel_benchmark: ${{ inputs.run_kernel_benchmark }}
+
+    steps:
+      - name: "检出仓库源码"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "严格校验勾选平台与项目标准文件路径"
+        id: calc-matrix
+        shell: bash
+        env:
+          IN_WIN: ${{ inputs.build_windows }}
+          IN_LINUX: ${{ inputs.build_linux }}
+          IN_MACOS: ${{ inputs.build_macos }}
+          IN_WASM: ${{ inputs.build_wasm }}
+          IN_SCOPE: ${{ inputs.build_scope }}
+          IN_TYPE: ${{ inputs.cmake_build_type }}
+          IN_BENCH: ${{ inputs.run_kernel_benchmark }}
+        run: |
+          set -euo pipefail
+
+          echo "=================================================================="
+          echo "  GeoStudio 3D 手动构建任务参数总览"
+          echo "  - Windows 桌面端 : ${IN_WIN}"
+          echo "  - Linux 桌面端   : ${IN_LINUX}"
+          echo "  - macOS 桌面端   : ${IN_MACOS}"
+          echo "  - WebAssembly    : ${IN_WASM}"
+          echo "  - 构建范围       : ${IN_SCOPE}"
+          echo "  - 编译优化级别   : ${IN_TYPE}"
+          echo "  - 运行内核自检   : ${IN_BENCH}"
+          echo "=================================================================="
+
+          if [[ "${IN_WIN}" != "true" && "${IN_LINUX}" != "true" && "${IN_MACOS}" != "true" && "${IN_WASM}" != "true" ]]; then
+            echo "::error::[参数错误] 您未勾选任何目标构建平台！请在 Run workflow 弹窗中至少勾选一个平台。"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, os
+
+          required_paths = [
+              "CMakeLists.txt",
+              "include/geo_kernel/core_types.hpp",
+              "include/geo_kernel/exact_predicates.hpp",
+              "include/geo_kernel/mmap_reader.hpp",
+              "include/geo_kernel/dat_parser.hpp",
+              "include/geo_kernel/point_octree.hpp",
+              "include/geo_kernel/tiled_tin.hpp",
+              "include/geo_kernel/tin_editor.hpp",
+              "include/geo_kernel/earthwork_calculator.hpp",
+              "include/geo_kernel/slope_grading.hpp",
+              "include/geo_kernel/geo_kernel_c_api.h",
+              "src/exact_predicates.cpp",
+              "src/mmap_reader.cpp",
+              "src/dat_parser.cpp",
+              "src/point_octree.cpp",
+              "src/tiled_tin.cpp",
+              "src/tin_editor.cpp",
+              "src/earthwork_calculator.cpp",
+              "src/slope_grading.cpp",
+              "src/geo_kernel_c_api.cpp",
+          ]
+
+          if os.environ.get("IN_BENCH") == "true":
+              required_paths.append("src/main_benchmark.cpp")
+
+          if os.environ.get("IN_SCOPE") == "full-app":
+              required_paths.extend([
+                  "frontend/package.json",
+                  "frontend/tsconfig.json",
+                  "frontend/index.html",
+                  "frontend/src/types/geo_protocol.ts",
+                  "frontend/src/bridge/kernel_bridge.ts",
+                  "frontend/src/shaders/point_cloud_edl.ts",
+                  "frontend/src/shaders/terrain_tin_shader.ts",
+                  "frontend/src/renderer/octree_lod_manager.ts",
+                  "frontend/src/renderer/tin_tile_manager.ts",
+                  "frontend/src/renderer/geo_viewport.ts",
+                  "frontend/src/styles/app.css",
+                  "frontend/src/main.ts",
+                  "src-tauri/Cargo.toml",
+                  "src-tauri/src/kernel_ffi.rs",
+                  "src-tauri/src/main.rs",
+              ])
+
+          missing = [p for p in required_paths if not os.path.isfile(p)]
+          if missing:
+              print("::error::[严格路径校验失败] 当前 Git 仓库分支中缺少以下标准路径文件：")
+              for m in missing:
+                  print(f"  - {m}")
+              print("\n[当前仓库根目录实际内容列表]")
+              for entry in sorted(os.listdir(".")):
+                  print(f"  * {entry}")
+              raise SystemExit(1)
+
+          print(f"[严格路径校验通过] 全部 {len(required_paths)} 个项目文件均位于标准路径下。")
+
+          targets = []
+          if os.environ.get("IN_WIN") == "true":
+              targets.append({
+                  "platform_id": "windows-x64",
+                  "platform_label": "Windows x86_64",
+                  "os": "windows-2022",
+                  "shared_lib": "GeoKernelCore.dll",
+                  "bench_exe": "GeoKernelBench.exe",
+                  "cmake_generator": "Ninja"
+              })
+          if os.environ.get("IN_LINUX") == "true":
+              targets.append({
+                  "platform_id": "linux-x64",
+                  "platform_label": "Linux x86_64",
+                  "os": "ubuntu-22.04",
+                  "shared_lib": "libGeoKernelCore.so",
+                  "bench_exe": "GeoKernelBench",
+                  "cmake_generator": "Ninja"
+              })
+          if os.environ.get("IN_MACOS") == "true":
+              targets.append({
+                  "platform_id": "macos-arm64",
+                  "platform_label": "macOS Apple Silicon",
+                  "os": "macos-latest",
+                  "shared_lib": "libGeoKernelCore.dylib",
+                  "bench_exe": "GeoKernelBench",
+                  "cmake_generator": "Ninja"
+              })
+
+          matrix_payload = json.dumps({"include": targets}, separators=(",", ":"))
+          has_native = "true" if len(targets) > 0 else "false"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"native_matrix={matrix_payload}\n")
+              fh.write(f"has_native_targets={has_native}\n")
+
+          print(f"[信息] 已生成原生平台构建矩阵 ({len(targets)} 个目标): {matrix_payload}")
+          PY
+
+  # ============================================================================
+  # 阶段 1：原生桌面多平台并行构建（Windows / Linux / macOS）
+  # ============================================================================
+  build-native-platforms:
+    name: "构建 [${{ matrix.platform_label }}]"
+    needs: prepare-build
+    if: needs.prepare-build.outputs.has_native_targets == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-build.outputs.native_matrix) }}
+
+    env:
+      PLATFORM_ID: ${{ matrix.platform_id }}
+      SHARED_LIB_NAME: ${{ matrix.shared_lib }}
+      BENCH_EXE_NAME: ${{ matrix.bench_exe }}
+      CMAKE_GEN: ${{ matrix.cmake_generator }}
+      BUILD_TYPE: ${{ needs.prepare-build.outputs.cmake_build_type }}
+      BUILD_SCOPE: ${{ needs.prepare-build.outputs.build_scope }}
+      LOG_DIR: "build-logs/${{ matrix.platform_id }}"
+      STAGE_STATUS_FILE: "build-logs/${{ matrix.platform_id }}/.stage_status.env"
+
+    steps:
+      - name: "1. 检出仓库源码"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "2. 初始化日志目录与记录环境快照"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${LOG_DIR}"
+          : > "${STAGE_STATUS_FILE}"
+
+          {
+            echo "==================== 00. 系统与工程环境快照 ===================="
+            echo "触发时间 (UTC) : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "触发操作员     : ${{ github.actor }}"
+            echo "代码分支/提交  : ${{ github.ref }} @ ${{ github.sha }}"
+            echo "目标平台标识   : ${PLATFORM_ID} (${{ matrix.os }})"
+            echo "构建范围       : ${BUILD_SCOPE} | 优化级别: ${BUILD_TYPE}"
+            echo "----------------------------------------------------------------"
+            uname -a || true
+            echo "----------------------------------------------------------------"
+            echo "[磁盘可用空间]"
+            df -h || true
+            echo "----------------------------------------------------------------"
+            echo "[基础构建工具版本]"
+            cmake --version || echo "cmake 未找到"
+            ninja --version || echo "ninja 未找到"
+            python3 --version || echo "python3 未找到"
+          } 2>&1 | tee "${LOG_DIR}/00_system_env.log"
+
+          echo "00_SYSTEM_ENV=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      # ------------------------------------------------------------------------
+      # 恢复增量构建缓存（C++ build/ + npm 依赖 + Rust target/ 与 Cargo 仓库）
+      # ------------------------------------------------------------------------
+      - name: "2B. [Cache] 恢复 C++20 增量编译缓存"
+        id: cache-cpp-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: build
+          key: "cpp-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.run_id }}"
+          restore-keys: |
+            cpp-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt') }}-
+            cpp-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-
+
+      - name: "2C. [Cache] 恢复前端 npm 依赖缓存"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        id: cache-npm-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: "npm-${{ matrix.platform_id }}-${{ hashFiles('frontend/package.json') }}-${{ github.run_id }}"
+          restore-keys: |
+            npm-${{ matrix.platform_id }}-${{ hashFiles('frontend/package.json') }}-
+            npm-${{ matrix.platform_id }}-
+
+      - name: "2D. [Cache] 恢复 Rust Cargo 仓库与 Tauri 编译缓存"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        id: cache-rust-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: "rust-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('src-tauri/Cargo.toml') }}-${{ github.run_id }}"
+          restore-keys: |
+            rust-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('src-tauri/Cargo.toml') }}-
+            rust-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-
+            rust-${{ matrix.platform_id }}-
+
+      - name: "3A. [Windows] 激活 MSVC x64 编译环境"
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: "3B. [Windows] 校验 MSVC cl.exe 与 Ninja 工具链"
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/01_toolchain_deps.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] Windows 工具链校验失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "01_TOOLCHAIN_DEPS=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 01. Windows MSVC 工具链校验 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            which cl
+            cl 2>&1 | head -n 5 || true
+            cmake --version
+            ninja --version
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "01_TOOLCHAIN_DEPS=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      - name: "3C. [Linux] 安装 C++20 与桌面运行库系统依赖"
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/01_toolchain_deps.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] Linux 系统依赖安装失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "01_TOOLCHAIN_DEPS=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 01. Linux 系统依赖安装 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+            for attempt in 1 2 3; do
+              echo "[尝试 ${attempt}/3] 执行 apt-get update..."
+              if sudo apt-get update -y; then
+                break
+              fi
+              if [[ "${attempt}" -eq 3 ]]; then
+                echo "[错误] apt-get update 连续 3 次失败！"
+                exit 1
+              fi
+              sleep 5
+            done
+
+            PACKAGES=(
+              build-essential
+              cmake
+              ninja-build
+              pkg-config
+              curl
+              wget
+              file
+              patchelf
+              libssl-dev
+              libxdo-dev
+              librsvg2-dev
+              libayatana-appindicator3-dev
+            )
+
+            if [[ "${BUILD_SCOPE}" == "full-app" ]]; then
+              PACKAGES+=(
+                libwebkit2gtk-4.1-dev
+                libgtk-3-dev
+                libsoup-3.0-dev
+                libjavascriptcoregtk-4.1-dev
+              )
+            fi
+
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+            g++ --version
+            cmake --version
+            ninja --version
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "01_TOOLCHAIN_DEPS=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      - name: "3D. [macOS] 安装 Ninja 并校验 Apple Clang"
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/01_toolchain_deps.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] macOS 工具链配置失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "01_TOOLCHAIN_DEPS=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 01. macOS 工具链配置 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            brew install ninja
+            clang++ --version
+            cmake --version
+            ninja --version
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "01_TOOLCHAIN_DEPS=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      - name: "4. 编译 C++20 独立空间几何内核 (GeoKernelCore & GeoKernelBench)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/02_cpp_kernel_build.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] C++20 几何内核编译失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "02_CPP_KERNEL_BUILD=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 02. C++20 几何内核配置与编译 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+            cmake -S . -B build \
+              -G "${CMAKE_GEN}" \
+              -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+              -DCMAKE_VERBOSE_MAKEFILE=ON \
+              -DGEO_BUILD_SHARED=ON \
+              -DGEO_BUILD_BENCHMARK=ON \
+              -DGEO_ENABLE_ARCH_OPT=ON
+
+            echo "------------------------------------------------------------------"
+            echo "[开始增量并行编译 C++20 源码]"
+            cmake --build build --config "${BUILD_TYPE}" --parallel
+
+            echo "------------------------------------------------------------------"
+            echo "[归集 C++20 几何内核动态库与头文件]"
+            mkdir -p "dist-kernel/${PLATFORM_ID}/include/geo_kernel"
+            cp -r include/geo_kernel/* "dist-kernel/${PLATFORM_ID}/include/geo_kernel/"
+
+            LIB_FOUND=$(find build/bin build/lib -type f -name "${SHARED_LIB_NAME}" 2>/dev/null | head -n 1 || true)
+            IMPORT_LIB_FOUND=$(find build/lib -type f -name "GeoKernelCore.lib" 2>/dev/null | head -n 1 || true)
+            BENCH_FOUND=$(find build/bin -type f -name "${BENCH_EXE_NAME}" 2>/dev/null | head -n 1 || true)
+
+            if [[ -z "${LIB_FOUND}" ]]; then
+              echo "[严重错误] 未找到核心动态库编译产物: ${SHARED_LIB_NAME}"
+              find build -maxdepth 4
+              exit 1
+            fi
+
+            cp "${LIB_FOUND}" "dist-kernel/${PLATFORM_ID}/"
+            echo "[成功] 动态库已归集: ${LIB_FOUND} -> dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}"
+
+            if [[ -n "${IMPORT_LIB_FOUND}" ]]; then
+              cp "${IMPORT_LIB_FOUND}" "dist-kernel/${PLATFORM_ID}/"
+              echo "[成功] Windows 导入库已归集: ${IMPORT_LIB_FOUND} -> dist-kernel/${PLATFORM_ID}/GeoKernelCore.lib"
+            fi
+
+            if [[ -n "${BENCH_FOUND}" ]]; then
+              cp "${BENCH_FOUND}" "dist-kernel/${PLATFORM_ID}/"
+              echo "[成功] 基准程序已归集: ${BENCH_FOUND} -> dist-kernel/${PLATFORM_ID}/${BENCH_EXE_NAME}"
+            fi
+
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "02_CPP_KERNEL_BUILD=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      - name: "5. 运行 GeoKernelBench 算法精度与性能端到端自检"
+        if: needs.prepare-build.outputs.run_kernel_benchmark == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/03_kernel_selftest.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] 几何内核端到端自检失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "03_KERNEL_SELFTEST=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 03. GeoKernelBench 端到端自检 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+            BENCH_BIN="dist-kernel/${PLATFORM_ID}/${BENCH_EXE_NAME}"
+            if [[ ! -f "${BENCH_BIN}" ]]; then
+              echo "[严重错误] 未找到可执行基准测试程序: ${BENCH_BIN}"
+              exit 1
+            fi
+
+            chmod +x "${BENCH_BIN}" || true
+            export LD_LIBRARY_PATH="${PWD}/dist-kernel/${PLATFORM_ID}:${LD_LIBRARY_PATH:-}"
+            export DYLD_LIBRARY_PATH="${PWD}/dist-kernel/${PLATFORM_ID}:${DYLD_LIBRARY_PATH:-}"
+            "${BENCH_BIN}" --points 500000 --grid 0.5
+
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "03_KERNEL_SELFTEST=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      - name: "6A. [Full-App] 配置 Node.js 20 环境"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "6B. [Full-App] 配置 Rust 稳定版工具链"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "7. [Full-App] 构建 TypeScript + Three.js 前端工程"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/04_frontend_build.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] 前端工程构建失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "04_FRONTEND_BUILD=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 04. TypeScript & Vite 前端构建 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+            cd frontend
+            node -v
+            npm -v
+
+            if [[ ! -f "vite.config.ts" && ! -f "vite.config.js" ]]; then
+              cat <<'EOF' > vite.config.ts
+          import { defineConfig } from 'vite';
+          export default defineConfig({
+            base: './',
+            server: { port: 1420, strictPort: true },
+            build: { target: 'es2022', outDir: 'dist', emptyOutDir: true }
+          });
+          EOF
+            fi
+
+            if [[ -f "package-lock.json" ]]; then
+              npm ci --prefer-offline --no-audit --no-fund
+            else
+              npm install --prefer-offline --no-audit --no-fund
+            fi
+
+            npm run build
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "04_FRONTEND_BUILD=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      - name: "8. [Full-App] 构建 Tauri v2 桌面宿主与原生安装包"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/05_tauri_bundle.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] Tauri v2 桌面端构建失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "05_TAURI_BUNDLE=FAILED" >> "${STAGE_STATUS_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== 05. Tauri v2 桌面端构建与打包 ===================="
+            echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+            # 锁定 Windows MSVC 原生链接器，防止 Git Bash /usr/bin/link.exe 干扰
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              CL_POSIX_PATH=$(which cl)
+              MSVC_BIN_POSIX=$(dirname "${CL_POSIX_PATH}")
+              MSVC_LINK_WIN=$(cygpath -w "${MSVC_BIN_POSIX}/link.exe")
+              export PATH="${MSVC_BIN_POSIX}:${PATH}"
+              export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="${MSVC_LINK_WIN}"
+              echo "[环境修正] 已锁定 MSVC 原生链接器: ${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER}"
+            fi
+
+            if [[ "${RUNNER_OS}" == "Linux" ]]; then
+              export APPIMAGE_EXTRACT_AND_RUN=1
+            fi
+
+            python3 - <<'PY'
+          import json, os, struct, zlib
+
+          os.makedirs("src-tauri/icons", exist_ok=True)
+          os.makedirs("src-tauri/resources", exist_ok=True)
+          os.makedirs("src-tauri/capabilities", exist_ok=True)
+
+          build_rs_path = "src-tauri/build.rs"
+          if not os.path.exists(build_rs_path):
+              with open(build_rs_path, "w", encoding="utf-8") as f:
+                  f.write("fn main() {\n    tauri_build::build()\n}\n")
+
+          cap_path = "src-tauri/capabilities/default.json"
+          if not os.path.exists(cap_path):
+              cap_data = {
+                  "$schema": "https://gen.tauri.app/schema/capability/2",
+                  "identifier": "default",
+                  "description": "GeoStudio 3D 主窗口默认安全权限声明",
+                  "windows": ["main"],
+                  "permissions": [
+                      "core:default",
+                      "dialog:default"
+                  ]
+              }
+              with open(cap_path, "w", encoding="utf-8") as f:
+                  json.dump(cap_data, f, indent=2, ensure_ascii=False)
+
+          def make_png_32x32():
+              w, h = 32, 32
+              raw = bytearray()
+              for _ in range(h):
+                  raw.append(0)
+                  for _ in range(w):
+                      raw.extend([37, 99, 235, 255])
+              def chunk(tag, data):
+                  return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+              ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
+              return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+
+          def make_bmp_ico_32x32():
+              w, h = 32, 32
+              xor_pixels = bytearray()
+              for _ in range(w * h):
+                  xor_pixels.extend([235, 99, 37, 255])
+              and_mask = b"\x00" * (w * h // 8)
+              bih = struct.pack("<IIIHHIIIIII", 40, w, h * 2, 1, 32, 0, len(xor_pixels) + len(and_mask), 0, 0, 0, 0)
+              dib = bih + bytes(xor_pixels) + and_mask
+              ico_header = struct.pack("<HHH", 0, 1, 1)
+              ico_entry = struct.pack("<BBBBHHII", w, h, 0, 0, 1, 32, len(dib), 22)
+              return ico_header + ico_entry + dib
+
+          png_path = "src-tauri/icons/icon.png"
+          if not os.path.exists(png_path):
+              with open(png_path, "wb") as f:
+                  f.write(make_png_32x32())
+
+          ico_path = "src-tauri/icons/icon.ico"
+          if not os.path.exists(ico_path):
+              with open(ico_path, "wb") as f:
+                  f.write(make_bmp_ico_32x32())
+
+          conf_path = "src-tauri/tauri.conf.json"
+          if not os.path.exists(conf_path):
+              conf = {
+                  "$schema": "https://schema.tauri.app/config/2",
+                  "productName": "GeoStudio3D",
+                  "version": "2.0.0",
+                  "identifier": "com.geokernel.geostudio3d",
+                  "build": {
+                      "frontendDist": "../frontend/dist"
+                  },
+                  "app": {
+                      "withGlobalTauri": True,
+                      "windows": [
+                          {
+                              "label": "main",
+                              "title": "GeoStudio 3D - 三维测绘点云与土方放坡系统",
+                              "width": 1440,
+                              "height": 900,
+                              "resizable": True
+                          }
+                      ],
+                      "security": {
+                          "csp": None
+                      }
+                  },
+                  "bundle": {
+                      "active": True,
+                      "targets": "all",
+                      "icon": ["icons/icon.png", "icons/icon.ico"],
+                      "resources": ["resources/*"]
+                  }
+              }
+              with open(conf_path, "w", encoding="utf-8") as f:
+                  json.dump(conf, f, indent=2, ensure_ascii=False)
+          PY
+
+            mkdir -p "src-tauri/target/release"
+            mkdir -p "src-tauri/target/debug"
+            cp "dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}" "src-tauri/resources/"
+            cp "dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}" "src-tauri/target/release/"
+            cp "dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}" "src-tauri/target/debug/"
+
+            # 1. 编译 Rust 桌面宿主程序（复用 target 缓存，秒级增量编译）
+            (
+              cd src-tauri
+              rustc --version
+              cargo --version
+              if [[ "${BUILD_TYPE}" == "Debug" ]]; then
+                cargo build
+              else
+                cargo build --release
+              fi
+            )
+
+            # 2. 使用预编译的 @tauri-apps/cli 快速打包原生安装程序（避免从源码编译 tauri-cli）
+            if [[ "${BUILD_TYPE}" == "Debug" ]]; then
+              npx --yes @tauri-apps/cli@2.1.0 build --debug || echo "[警告] 安装包封装器部分跳过，已保留编译完成的桌面主程序二进制"
+            else
+              npx --yes @tauri-apps/cli@2.1.0 build || echo "[警告] 安装包封装器部分跳过，已保留编译完成的桌面主程序二进制"
+            fi
+
+            echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          } 2>&1 | tee "${LOG_FILE}"
+          echo "05_TAURI_BUNDLE=SUCCESS" >> "${STAGE_STATUS_FILE}"
+
+      # ------------------------------------------------------------------------
+      # 无论构建成功或失败（if: always()），强制保存最新增量编译缓存供下次秒级复用
+      # ------------------------------------------------------------------------
+      - name: "8B. [Always Cache] 保存 C++20 增量构建缓存"
+        if: always() && hashFiles('build/CMakeCache.txt') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: build
+          key: "cpp-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.run_id }}"
+
+      - name: "8C. [Always Cache] 保存前端 npm 依赖缓存"
+        if: always() && needs.prepare-build.outputs.build_scope == 'full-app' && hashFiles('frontend/node_modules') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: "npm-${{ matrix.platform_id }}-${{ hashFiles('frontend/package.json') }}-${{ github.run_id }}"
+
+      - name: "8D. [Always Cache] 保存 Rust Cargo 与 Tauri 编译缓存"
+        if: always() && needs.prepare-build.outputs.build_scope == 'full-app' && hashFiles('src-tauri/target') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: "rust-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('src-tauri/Cargo.toml') }}-${{ github.run_id }}"
+
+      # ------------------------------------------------------------------------
+      # 步骤 9：无论构建成功或失败（if: always()），采集完整深度诊断信息
+      # ------------------------------------------------------------------------
+      - name: "9. [Always] 采集深度诊断快照与生成中文构建分析报告"
+        if: always()
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set +e
+          mkdir -p "${LOG_DIR}/cmake-internals"
+
+          [[ -f "build/CMakeCache.txt" ]] && cp "build/CMakeCache.txt" "${LOG_DIR}/cmake-internals/"
+          [[ -f "build/CMakeFiles/CMakeConfigureLog.yaml" ]] && cp "build/CMakeFiles/CMakeConfigureLog.yaml" "${LOG_DIR}/cmake-internals/"
+          [[ -f "build/CMakeFiles/CMakeOutput.log" ]] && cp "build/CMakeFiles/CMakeOutput.log" "${LOG_DIR}/cmake-internals/"
+          [[ -f "build/CMakeFiles/CMakeError.log" ]] && cp "build/CMakeFiles/CMakeError.log" "${LOG_DIR}/cmake-internals/"
+
+          {
+            echo "==================== 98. 二进制产物与动态库依赖诊断 ===================="
+            LIB_PATH="dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}"
+            if [[ -f "${LIB_PATH}" ]]; then
+              ls -lh "${LIB_PATH}"
+              if [[ "${RUNNER_OS}" == "Linux" ]]; then
+                echo "--- ldd 动态库依赖检查 ---"
+                ldd "${LIB_PATH}" || true
+                echo "--- nm 导出 C ABI 符号检查 (geo_*) ---"
+                nm -D --defined-only "${LIB_PATH}" | grep "geo_" || true
+              elif [[ "${RUNNER_OS}" == "macOS" ]]; then
+                echo "--- otool -L 动态库依赖检查 ---"
+                otool -L "${LIB_PATH}" || true
+                echo "--- nm 导出 C ABI 符号检查 (_geo_*) ---"
+                nm -gU "${LIB_PATH}" | grep "_geo_" || true
+              elif [[ "${RUNNER_OS}" == "Windows" ]]; then
+                echo "--- dumpbin /dependents 与 /exports 检查 ---"
+                MSYS_NO_PATHCONV=1 dumpbin /dependents "${LIB_PATH}" || true
+                MSYS_NO_PATHCONV=1 dumpbin /exports "${LIB_PATH}" | grep "geo_" || true
+              fi
+            else
+              echo "[提示] 未找到 ${LIB_PATH}，说明 C++20 内核阶段在生成产物前已中止。"
+            fi
+
+            echo "------------------------------------------------------------------------"
+            echo "[构建结束时磁盘剩余空间]"
+            df -h || true
+          } > "${LOG_DIR}/98_binary_diagnostics.log" 2>&1
+
+          {
+            echo "# GeoStudio 3D 构建与诊断汇总报告 (${PLATFORM_ID})"
+            echo ""
+            echo "- **任务最终状态**: \`${JOB_STATUS}\`"
+            echo "- **目标运行环境**: \`${{ matrix.os }}\`"
+            echo "- **构建范围**: \`${BUILD_SCOPE}\` \vert{} **优化级别**: \`${BUILD_TYPE}\`"
+            echo "- **报告生成时间**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "## 各阶段执行轨迹"
+            echo '```text'
+            cat "${STAGE_STATUS_FILE}" || true
+            echo '```'
+            echo ""
+            echo "## 关键错误线索自动提取（含上下文，兼容 MSVC / GCC / Clang / Rust / CMake）"
+            echo '```text'
+            grep -rnE -C 2 "(error( C[0-9]+|\[E[0-9]+\])?:|fatal error( C[0-9]+)?:|LNK[0-9]+:|FAILED|CMake Error|致命错误|严重错误)" "${LOG_DIR}"/*.log 2>/dev/null | head -n 120 || echo "未检测到致命编译或链接错误关键字。"
+            echo '```'
+
+            echo ""
+            echo "## 完整日志压缩包文件说明"
+            echo "| 日志文件名 | 对应阶段 | 排查用途 |"
+            echo "| :--- | :--- | :--- |"
+            echo "| \`00_system_env.log\` | 环境快照 | 操作系统版本、磁盘空间与工具链版本 |"
+            echo "| \`01_toolchain_deps.log\` | 工具链依赖 | MSVC / APT / Homebrew 安装详情 |"
+            echo "| \`02_cpp_kernel_build.log\` | C++20 内核 | CMake 配置与编译器详细命令行及报错 |"
+            echo "| \`03_kernel_selftest.log\` | 内核自检 | GeoKernelBench 点云/三角网/土方放坡压测输出 |"
+            echo "| \`04_frontend_build.log\` | 前端构建 | npm 依赖安装、TypeScript 检查与 Vite 打包 |"
+            echo "| \`05_tauri_bundle.log\` | 桌面打包 | Rust FFI 编译与 Tauri 桌面程序构建日志 |"
+            echo "| \`98_binary_diagnostics.log\` | 依赖分析 | 动态库 C ABI 导出符号表与运行库依赖 |"
+            echo "| \`cmake-internals/\` | CMake 内部 | CMakeCache.txt 与 CMakeConfigureLog.yaml |"
+          } > "${LOG_DIR}/99_diagnostics_summary.md"
+
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            cat "${LOG_DIR}/99_diagnostics_summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: "10. [Always] 上传详细构建与故障排查日志包"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "build-logs-${{ matrix.platform_id }}-run${{ github.run_number }}"
+          path: "${{ env.LOG_DIR }}"
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: "11. [Success] 归集发布产物与生成 SHA256 校验清单"
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_DIR="release-bundle/${PLATFORM_ID}"
+          mkdir -p "${RELEASE_DIR}/kernel"
+          cp -r "dist-kernel/${PLATFORM_ID}/"* "${RELEASE_DIR}/kernel/"
+
+          if [[ "${BUILD_SCOPE}" == "full-app" ]]; then
+            mkdir -p "${RELEASE_DIR}/desktop-app"
+            find src-tauri/target -maxdepth 5 -type f \( \
+              -name "geo-studio-3d*" -o \
+              -name "GeoStudio3D*" -o \
+              -name "*.msi" -o \
+              -name "*.deb" -o \
+              -name "*.rpm" -o \
+              -name "*.AppImage" -o \
+              -name "*.dmg" \
+            \) ! -name "*.d" ! -name "*.pdb" ! -path "*/build/*" ! -path "*/deps/*" ! -path "*/incremental/*" -exec cp {} "${RELEASE_DIR}/desktop-app/" \; || true
+          fi
+
+          cd "${RELEASE_DIR}"
+          find . -type f ! -name "SHA256SUMS.txt" -exec sha256sum {} + > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: "12. [Success] 上传平台发布构建产物"
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "release-artifacts-${{ matrix.platform_id }}-run${{ github.run_number }}"
+          path: "release-bundle/${{ matrix.platform_id }}"
+          retention-days: 30
+
+  # ============================================================================
+  # 阶段 2：WebAssembly (Emscripten WASM) 跨端目标构建（勾选 build_wasm 时运行）
+  # ============================================================================
+  build-wasm-target:
+    name: "构建 [WebAssembly (Emscripten WASM)]"
+    needs: prepare-build
+    if: needs.prepare-build.outputs.build_wasm == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    env:
+      LOG_DIR: "build-logs/wasm-emscripten"
+      BUILD_TYPE: ${{ needs.prepare-build.outputs.cmake_build_type }}
+      BUILD_SCOPE: ${{ needs.prepare-build.outputs.build_scope }}
+
+    steps:
+      - name: "1. 检出仓库源码"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "1B. [Cache] 恢复 WASM 增量编译与 npm 缓存"
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build-wasm
+            ~/.npm
+            frontend/node_modules
+          key: "wasm-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt', 'frontend/package.json') }}-${{ github.run_id }}"
+          restore-keys: |
+            wasm-${{ env.BUILD_TYPE }}-
+
+      - name: "2. 安装 Emscripten SDK (emsdk)"
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: "3.1.64"
+
+      - name: "3. 编译 C++20 几何内核为 WebAssembly (.wasm + .js)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${LOG_DIR}"
+          LOG_FILE="${LOG_DIR}/01_wasm_kernel_build.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] WebAssembly 内核编译失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            echo "==================== [WASM] Emscripten 编译 ===================="
+            emcc --version
+            cmake --version
+
+            emcmake cmake -S . -B build-wasm \
+              -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+              -DCMAKE_VERBOSE_MAKEFILE=ON \
+              -DGEO_BUILD_SHARED=OFF \
+              -DGEO_BUILD_BENCHMARK=OFF
+
+            cmake --build build-wasm --parallel
+
+            mkdir -p "release-bundle/wasm-emscripten/include/geo_kernel"
+            cp -r include/geo_kernel/* "release-bundle/wasm-emscripten/include/geo_kernel/"
+
+            STATIC_LIB=$(find build-wasm/lib -type f -name "libGeoKernelCore.a" | head -n 1)
+            if [[ -z "${STATIC_LIB}" ]]; then
+              echo "[严重错误] 未找到 WASM 静态库 build-wasm/lib/libGeoKernelCore.a"
+              exit 1
+            fi
+
+            emcc "${STATIC_LIB}" \
+              -O3 -msimd128 -pthread \
+              -sMODULARIZE=1 \
+              -sEXPORT_ES6=1 \
+              -sALLOW_MEMORY_GROWTH=1 \
+              -sMAXIMUM_MEMORY=2GB \
+              -sEXPORTED_FUNCTIONS='["_malloc","_free","_geo_get_version","_geo_get_last_error","_geo_project_create","_geo_project_destroy","_geo_default_dat_load_params","_geo_project_load_dat","_geo_default_octree_params","_geo_project_build_octree","_geo_project_query_visible_octree_nodes","_geo_project_fetch_octree_node_gpu_packet","_geo_default_tin_params","_geo_project_build_tin","_geo_project_query_elevation","_geo_project_get_dirty_tin_tiles","_geo_project_fetch_tin_tile_gpu_packet","_geo_project_pick_tin_ray","_geo_project_tin_flip_edge","_geo_project_tin_modify_vertex_z","_geo_project_tin_insert_vertex","_geo_project_tin_insert_breakline","_geo_project_tin_clip_polygon","_geo_project_tin_undo","_geo_project_tin_redo","_geo_project_tin_get_history_state","_geo_project_compute_earthwork_exact","_geo_project_compute_earthwork_grid","_geo_default_grading_params","_geo_project_compute_slope_grading"]' \
+              -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","UTF8ToString","stringToUTF8","HEAPU8","HEAPF64","HEAPU32"]' \
+              -o "release-bundle/wasm-emscripten/geo_kernel_wasm.js"
+
+            ls -lh "release-bundle/wasm-emscripten/"
+          } 2>&1 | tee "${LOG_FILE}"
+
+      - name: "4. [Full-App] 配置 Node.js 20 环境"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "5. [Full-App] 构建 Web 前端静态发布包"
+        if: needs.prepare-build.outputs.build_scope == 'full-app'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_FILE="${LOG_DIR}/02_wasm_frontend_build.log"
+          ERR_REPORTED=0
+          on_step_err() {
+            local ec=$?
+            if [[ "${ERR_REPORTED}" -eq 0 ]]; then
+              ERR_REPORTED=1
+              echo "[致命错误] WASM Web 前端构建失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+            fi
+            exit "${ec}"
+          }
+          trap 'on_step_err $LINENO' ERR
+
+          {
+            cd frontend
+            npm install --prefer-offline --no-audit --no-fund
+            npm run build
+            mkdir -p "../release-bundle/wasm-emscripten/web-dist"
+            cp -r dist/* "../release-bundle/wasm-emscripten/web-dist/"
+          } 2>&1 | tee "${LOG_FILE}"
+
+      - name: "5B. [Always Cache] 保存 WASM 增量编译缓存"
+        if: always() && hashFiles('build-wasm/CMakeCache.txt') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build-wasm
+            ~/.npm
+            frontend/node_modules
+          key: "wasm-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt', 'frontend/package.json') }}-${{ github.run_id }}"
+
+      - name: "6. [Always] 归档 WASM CMake 内部日志"
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "${LOG_DIR}/cmake-internals"
+          [[ -f "build-wasm/CMakeCache.txt" ]] && cp "build-wasm/CMakeCache.txt" "${LOG_DIR}/cmake-internals/"
+          [[ -f "build-wasm/CMakeFiles/CMakeConfigureLog.yaml" ]] && cp "build-wasm/CMakeFiles/CMakeConfigureLog.yaml" "${LOG_DIR}/cmake-internals/"
+
+      - name: "7. [Always] 上传 WASM 详细构建日志包"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "build-logs-wasm-emscripten-run${{ github.run_number }}"
+          path: "${{ env.LOG_DIR }}"
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: "8. [Success] 上传 WASM 与 Web 发布产物"
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "release-artifacts-wasm-emscripten-run${{ github.run_number }}"
+          path: "release-bundle/wasm-emscripten"
+          retention-days: 30
+

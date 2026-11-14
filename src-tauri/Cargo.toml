@@ -1,0 +1,24 @@
+[package]
+name = "geo-studio-3d"
+version = "2.0.0"
+description = "GeoStudio 3D 桌面宿主（Rust FFI + geotile:// 零拷贝二进制瓦片流网关）"
+authors = ["GeoKernel Engineering"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+# 自定义 geotile:// 协议通过 register_uri_scheme_protocol 注册，无需启用 protocol-asset 特性
+tauri = { version = "2.1.0", features = [] }
+tauri-plugin-dialog = "2.0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libloading = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
