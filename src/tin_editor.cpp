@@ -1,5 +1,4 @@
 #include "geo_kernel/tin_editor.hpp"
-
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -7,13 +6,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
 #include "geo_kernel/exact_predicates.hpp"
 
 namespace geo_kernel {
-
 namespace {
-
 constexpr double kVertexSnapEps = 1e-6;         // 顶点平面吸附阈值（1 微米）
 constexpr double kVertexSnapEpsSq = 1e-12;
 constexpr double kCollinearEps = 1e-9;
@@ -59,13 +55,11 @@ bool IsPointInPolygon2D(double px, double py, const std::vector<Vec3d>& poly) no
     }
     return inside;
 }
-
 }  // namespace
 
 // ==============================================================================
 // 事务增量录制器（确保同一顶点/三角形在单次复合操作中只记录原始 before 状态与最终 after 状态）
 // ==============================================================================
-
 class TinTopologyEditor::TransactionRecorder {
 public:
     explicit TransactionRecorder(TiledTinSurface& surface, std::string desc)
@@ -111,7 +105,6 @@ public:
             d.existed_before = true;
             d.before_state = surface_.triangles_[tid];
             tx_.triangle_deltas.push_back(d);
-
             if (d.before_state.is_active) {
                 tx_.affected_bounds.Expand(surface_.vertices_[d.before_state.v[0]].Position());
                 tx_.affected_bounds.Expand(surface_.vertices_[d.before_state.v[1]].Position());
@@ -130,7 +123,6 @@ public:
         d.existed_before = false;
         d.after_state = tri;
         tx_.triangle_deltas.push_back(d);
-
         if (tri.is_active) {
             tx_.affected_bounds.Expand(surface_.vertices_[tri.v[0]].Position());
             tx_.affected_bounds.Expand(surface_.vertices_[tri.v[1]].Position());
@@ -156,10 +148,22 @@ public:
                 }
             }
         }
+        GEO_LOG_DEBUG(
+            "TIN_EDIT",
+            "事务[%s]提交: vertex_deltas=%zu, triangle_deltas=%zu",
+            tx_.description.c_str(),
+            tx_.vertex_deltas.size(),
+            tx_.triangle_deltas.size());
         return std::move(tx_);
     }
 
     void Rollback() {
+        GEO_LOG_WARN(
+            "TIN_EDIT",
+            "回滚失败事务[%s]: vertex_deltas=%zu, triangle_deltas=%zu",
+            tx_.description.c_str(),
+            tx_.vertex_deltas.size(),
+            tx_.triangle_deltas.size());
         for (auto it = tx_.triangle_deltas.rbegin(); it != tx_.triangle_deltas.rend(); ++it) {
             if (it->existed_before) {
                 surface_.triangles_[it->triangle_id] = it->before_state;
@@ -174,7 +178,6 @@ public:
             surface_.triangles_.pop_back();
             tx_.triangle_deltas.pop_back();
         }
-
         for (auto it = tx_.vertex_deltas.rbegin(); it != tx_.vertex_deltas.rend(); ++it) {
             if (it->existed_before) {
                 surface_.vertices_[it->vertex_id] = it->before_state;
@@ -199,7 +202,6 @@ private:
 // ==============================================================================
 // TinTopologyEditor 公开接口与拓扑算法实现
 // ==============================================================================
-
 TinTopologyEditor::TinTopologyEditor(TiledTinSurface& surface, size_t max_undo_levels) noexcept
     : surface_(surface),
       max_undo_levels_(max_undo_levels > 0 ? max_undo_levels : 64) {
@@ -229,25 +231,21 @@ OperationResult TinTopologyEditor::FlipEdge(
     if (tri_id >= surface_.triangles_.size() || edge_slot < 0 || edge_slot > 2) {
         return OperationResult::Fail(StatusCode::kInvalidArgument, "非法的三角形编号或边槽位索引");
     }
-
     const TinTriangle& t_a = surface_.triangles_[tri_id];
     if (!t_a.is_active) {
         return OperationResult::Fail(StatusCode::kInvalidArgument, "目标三角形已被删除或裁剪");
     }
-
     const uint32_t adj_id = t_a.adj[edge_slot];
     if (adj_id == UINT32_MAX || adj_id >= surface_.triangles_.size() || !surface_.triangles_[adj_id].is_active) {
         return OperationResult::Fail(
             StatusCode::kTopologyDegeneracy,
             "目标边为三角网外边界边，不存在相邻三角形，无法执行对角线翻转");
     }
-
     if (!force_flip && t_a.IsEdgeConstrained(edge_slot)) {
         return OperationResult::Fail(
             StatusCode::kTopologyDegeneracy,
             "目标边为已锁定的特征线/断裂线约束边，禁止普通边翻转");
     }
-
     const TinTriangle& t_b = surface_.triangles_[adj_id];
     const int adj_slot = t_b.IndexOfNeighbor(tri_id);
     if (adj_slot < 0) {
@@ -258,13 +256,12 @@ OperationResult TinTopologyEditor::FlipEdge(
     const uint32_t s0 = t_a.v[(edge_slot + 1) % 3];
     const uint32_t s1 = t_a.v[(edge_slot + 2) % 3];
     const uint32_t opp_b = t_b.v[adj_slot];
-
     const Vec3d& p_opp_a = surface_.vertices_[opp_a].Position();
     const Vec3d& p_s0 = surface_.vertices_[s0].Position();
     const Vec3d& p_opp_b = surface_.vertices_[opp_b].Position();
     const Vec3d& p_s1 = surface_.vertices_[s1].Position();
 
-    // 严格凸性检验：四边形 (opp_a -> s0 -> opp_b -> s1) 的两条新对角线内角必须严格小于 180 度
+    // 严格凸性检验：四边形 (opp_a -> s0 -> opp_b -> s1) 必须严格凸
     if (ExactPredicates::Orient2D(p_opp_a, p_s0, p_opp_b) <= 0.0 ||
         ExactPredicates::Orient2D(p_opp_b, p_s1, p_opp_a) <= 0.0) {
         return OperationResult::Fail(
@@ -331,7 +328,6 @@ OperationResult TinTopologyEditor::FlipEdge(
             ot.SetEdgeConstrained(s, is_c);
         }
     };
-
     relink_outer(nb_s0_oppb, adj_id, tri_id, 0);
     relink_outer(nb_oppa_s0, tri_id, tri_id, 2);
     relink_outer(nb_s1_oppa, tri_id, adj_id, 0);
@@ -340,6 +336,8 @@ OperationResult TinTopologyEditor::FlipEdge(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("TIN_EDIT", "边翻转成功: triA=%u, triB=%u, 原共享点(%u,%u)->新对角线(%u,%u)",
+                 tri_id, adj_id, s0, s1, opp_a, opp_b);
     return OperationResult::Ok();
 }
 
@@ -354,11 +352,14 @@ OperationResult TinTopologyEditor::ModifyVertexElevation(uint32_t vertex_id, dou
         return OperationResult::Fail(StatusCode::kInvalidArgument, "目标高程数值非法 (NaN/Inf)");
     }
 
+#if GEO_DEBUG_ENABLED
+    const double old_z = surface_.vertices_[vertex_id].z;
+#endif
     TransactionRecorder recorder(surface_, "修改顶点高程");
     recorder.RecordVertexBefore(vertex_id);
     surface_.vertices_[vertex_id].z = new_local_z;
-
     TinEditTransaction tx = recorder.Finalize();
+
     const double pad = surface_.TileSize();
     tx.affected_bounds.Expand({
         surface_.vertices_[vertex_id].x - pad,
@@ -373,6 +374,7 @@ OperationResult TinTopologyEditor::ModifyVertexElevation(uint32_t vertex_id, dou
 
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("TIN_EDIT", "顶点 #%u 高程修改完成: %.4f -> %.4f m", vertex_id, old_z, new_local_z);
     return OperationResult::Ok();
 }
 
@@ -381,20 +383,16 @@ void TinTopologyEditor::LegalizeEdgesInternal(
     TransactionRecorder& recorder) {
     size_t guard = 0;
     const size_t max_flips = surface_.triangles_.size() * 4 + 256;
-
     while (!edge_stack.empty() && guard++ < max_flips) {
         const auto [tid, slot] = edge_stack.back();
         edge_stack.pop_back();
-
         if (tid >= surface_.triangles_.size() || slot < 0 || slot > 2) continue;
         const TinTriangle& t_a = surface_.triangles_[tid];
         if (!t_a.is_active || t_a.IsEdgeConstrained(slot)) continue;
-
         const uint32_t adj_id = t_a.adj[slot];
         if (adj_id == UINT32_MAX || adj_id >= surface_.triangles_.size()) continue;
         const TinTriangle& t_b = surface_.triangles_[adj_id];
         if (!t_b.is_active) continue;
-
         const int adj_slot = t_b.IndexOfNeighbor(tid);
         if (adj_slot < 0) continue;
 
@@ -402,7 +400,6 @@ void TinTopologyEditor::LegalizeEdgesInternal(
         const uint32_t s0 = t_a.v[(slot + 1) % 3];
         const uint32_t s1 = t_a.v[(slot + 2) % 3];
         const uint32_t opp_b = t_b.v[adj_slot];
-
         const Vec3d& p_opp_a = surface_.vertices_[opp_a].Position();
         const Vec3d& p_s0 = surface_.vertices_[s0].Position();
         const Vec3d& p_s1 = surface_.vertices_[s1].Position();
@@ -413,7 +410,6 @@ void TinTopologyEditor::LegalizeEdgesInternal(
                 ExactPredicates::Orient2D(p_opp_b, p_s1, p_opp_a) <= 0.0) {
                 continue;
             }
-
             recorder.RecordTriangleBefore(tid);
             recorder.RecordTriangleBefore(adj_id);
 
@@ -490,9 +486,9 @@ OperationResult TinTopologyEditor::InsertVertexInternal(
     uint32_t existing_vid = UINT32_MAX;
     if (surface_.FindNearestVertex2D(local_pt.x, local_pt.y, kVertexSnapEps, existing_vid)) {
         out_vertex_id = existing_vid;
+        GEO_LOG_DEBUG("TIN_EDIT", "插点吸附到已有重合顶点 #%u", existing_vid);
         return OperationResult::Ok();
     }
-
     double interp_z = 0.0;
     uint32_t hit_tid = UINT32_MAX;
     if (!surface_.QueryElevationAt(local_pt.x, local_pt.y, interp_z, &hit_tid) ||
@@ -531,7 +527,6 @@ OperationResult TinTopologyEditor::InsertVertexInternal(
     }
 
     std::vector<std::pair<uint32_t, int>> legalize_stack;
-
     if (on_edge_slot >= 0 && orig_t.adj[on_edge_slot] != UINT32_MAX &&
         surface_.triangles_[orig_t.adj[on_edge_slot]].is_active) {
         const uint32_t t1_id = hit_tid;
@@ -542,19 +537,15 @@ OperationResult TinTopologyEditor::InsertVertexInternal(
         if (s2 < 0) {
             return OperationResult::Fail(StatusCode::kInternalError, "边上插点时邻接拓扑异常");
         }
-
         const bool edge_was_constrained = t1.IsEdgeConstrained(on_edge_slot);
-
         const uint32_t a = t1.v[on_edge_slot];
         const uint32_t b = t1.v[(on_edge_slot + 1) % 3];
         const uint32_t c = t1.v[(on_edge_slot + 2) % 3];
         const uint32_t d = t2.v[s2];
-
         const uint32_t nb_ca = t1.adj[(on_edge_slot + 1) % 3];
         const uint32_t nb_ab = t1.adj[(on_edge_slot + 2) % 3];
         const uint32_t nb_bd = t2.adj[(s2 + 1) % 3];
         const uint32_t nb_dc = t2.adj[(s2 + 2) % 3];
-
         const bool c_ca = t1.IsEdgeConstrained((on_edge_slot + 1) % 3);
         const bool c_ab = t1.IsEdgeConstrained((on_edge_slot + 2) % 3);
         const bool c_bd = t2.IsEdgeConstrained((s2 + 1) % 3);
@@ -572,7 +563,6 @@ OperationResult TinTopologyEditor::InsertVertexInternal(
         nt_ca.region_tag = t1.region_tag;
         nt_bd.region_tag = t2.region_tag;
         nt_dc.region_tag = t2.region_tag;
-
         const uint32_t id_ab = t1_id;
         const uint32_t id_bd = t2_id;
         const uint32_t id_ca = recorder.AllocateTriangle(nt_ca);
@@ -631,7 +621,6 @@ OperationResult TinTopologyEditor::InsertVertexInternal(
         nt0.region_tag = orig_t.region_tag;
         nt1.region_tag = orig_t.region_tag;
         nt2.region_tag = orig_t.region_tag;
-
         const uint32_t id0 = hit_tid;
         const uint32_t id1 = recorder.AllocateTriangle(nt1);
         const uint32_t id2 = recorder.AllocateTriangle(nt2);
@@ -682,7 +671,6 @@ OperationResult TinTopologyEditor::InsertVertex(
     if (!surface_.IsValid()) {
         return OperationResult::Fail(StatusCode::kEmptyDataset, "当前三角网为空，无法插入顶点");
     }
-
     TransactionRecorder recorder(surface_, "插入三角网顶点");
     uint32_t vid = UINT32_MAX;
     OperationResult res = InsertVertexInternal(
@@ -691,14 +679,13 @@ OperationResult TinTopologyEditor::InsertVertex(
         recorder.Rollback();
         return res;
     }
-
     if (out_vertex_id != nullptr) {
         *out_vertex_id = vid;
     }
-
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("TIN_EDIT", "插入顶点成功: vid=%u, pos=(%.3f, %.3f, %.3f)", vid, local_pt.x, local_pt.y, local_pt.z);
     return OperationResult::Ok();
 }
 
@@ -714,7 +701,6 @@ void TinTopologyEditor::TriangulateSimpleCavityPolygon(
     TransactionRecorder& recorder) {
     out_base_tri_id = UINT32_MAX;
     out_base_edge_slot = -1;
-
     const size_t n = poly_verts.size();
     if (n < 3) return;
 
@@ -724,7 +710,6 @@ void TinTopologyEditor::TriangulateSimpleCavityPolygon(
         int edge_adj_slot = -1;
         uint8_t edge_constrained = 0;
     };
-
     std::vector<PolyNode> ring(n);
     for (size_t i = 0; i < n; ++i) {
         ring[i].vid = poly_verts[i];
@@ -736,28 +721,23 @@ void TinTopologyEditor::TriangulateSimpleCavityPolygon(
     std::vector<uint32_t> created_tris;
     created_tris.reserve(n - 2);
     std::vector<std::pair<uint32_t, int>> internal_legalize_edges;
-
     size_t guard = 0;
+
     while (ring.size() > 3 && guard++ < n * n + 16) {
         bool ear_found = false;
         const size_t m = ring.size();
-
         for (size_t i = 0; i < m; ++i) {
             const size_t prev_idx = (i + m - 1) % m;
             const size_t next_idx = (i + 1) % m;
-
             const uint32_t va = ring[prev_idx].vid;
             const uint32_t vb = ring[i].vid;
             const uint32_t vc = ring[next_idx].vid;
-
             const Vec3d& pa = surface_.vertices_[va].Position();
             const Vec3d& pb = surface_.vertices_[vb].Position();
             const Vec3d& pc = surface_.vertices_[vc].Position();
-
             if (ExactPredicates::Orient2D(pa, pb, pc) <= 0.0) {
                 continue;
             }
-
             bool contains_other_vertex = false;
             for (size_t k = 0; k < m; ++k) {
                 if (k == prev_idx || k == i || k == next_idx) continue;
@@ -778,12 +758,10 @@ void TinTopologyEditor::TriangulateSimpleCavityPolygon(
             nt.v[1] = vb;
             nt.v[2] = vc;
             nt.is_active = 1;
-
             nt.adj[0] = ring[i].edge_adj_tri;
             nt.adj[2] = ring[prev_idx].edge_adj_tri;
             nt.SetEdgeConstrained(0, ring[i].edge_constrained != 0);
             nt.SetEdgeConstrained(2, ring[prev_idx].edge_constrained != 0);
-
             const uint32_t new_tid = recorder.AllocateTriangle(nt);
             created_tris.push_back(new_tid);
 
@@ -799,15 +777,13 @@ void TinTopologyEditor::TriangulateSimpleCavityPolygon(
             ring[prev_idx].edge_adj_tri = new_tid;
             ring[prev_idx].edge_adj_slot = 1;
             ring[prev_idx].edge_constrained = 0;
-
             internal_legalize_edges.emplace_back(new_tid, 1);
-
             ring.erase(ring.begin() + static_cast<std::ptrdiff_t>(i));
             ear_found = true;
             break;
         }
-
         if (!ear_found) {
+            GEO_LOG_WARN("TIN_EDIT", "耳切重剖分空腔多边形未找到有效耳尖，剩余顶点数=%zu", ring.size());
             break;
         }
     }
@@ -818,17 +794,14 @@ void TinTopologyEditor::TriangulateSimpleCavityPolygon(
         last_t.v[1] = ring[1].vid;
         last_t.v[2] = ring[2].vid;
         last_t.is_active = 1;
-
         last_t.adj[0] = ring[1].edge_adj_tri;
         last_t.adj[1] = ring[2].edge_adj_tri;
         last_t.adj[2] = ring[0].edge_adj_tri;
         last_t.SetEdgeConstrained(0, ring[1].edge_constrained != 0);
         last_t.SetEdgeConstrained(1, ring[2].edge_constrained != 0);
         last_t.SetEdgeConstrained(2, ring[0].edge_constrained != 0);
-
         const uint32_t last_tid = recorder.AllocateTriangle(last_t);
         created_tris.push_back(last_tid);
-
         for (int e = 0; e < 3; ++e) {
             const size_t r_idx = (e + 1) % 3;
             const uint32_t nb = ring[r_idx].edge_adj_tri;
@@ -865,7 +838,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
     if (start_vid == end_vid || recursion_depth > 64) {
         return OperationResult::Ok();
     }
-
     const Vec3d& p_start = surface_.vertices_[start_vid].Position();
     const Vec3d& p_end = surface_.vertices_[end_vid].Position();
     if (p_start.DistanceSquared2D(p_end) <= kVertexSnapEpsSq) {
@@ -878,7 +850,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
         if (!t.is_active) continue;
         const int idx_s = t.IndexOfVertex(start_vid);
         if (idx_s < 0) continue;
-
         start_fan_tri = tid;
         const int idx_e = t.IndexOfVertex(end_vid);
         if (idx_e >= 0) {
@@ -891,7 +862,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
                 surface_.vertices_[start_vid].code_id = code_id;
                 surface_.vertices_[end_vid].code_id = code_id;
             }
-
             const uint32_t nb_tid = t.adj[shared_slot];
             if (nb_tid != UINT32_MAX && surface_.triangles_[nb_tid].is_active) {
                 const int nb_slot = surface_.triangles_[nb_tid].IndexOfNeighbor(tid);
@@ -903,25 +873,21 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
             return OperationResult::Ok();
         }
     }
-
     if (start_fan_tri == UINT32_MAX) {
         return OperationResult::Fail(StatusCode::kInternalError, "无法定位特征线起点的关联三角形");
     }
 
     uint32_t first_crossed_tri = UINT32_MAX;
     int first_exit_slot = -1;
-
     for (uint32_t tid = 0; tid < surface_.triangles_.size(); ++tid) {
         const TinTriangle& t = surface_.triangles_[tid];
         if (!t.is_active) continue;
         const int idx_s = t.IndexOfVertex(start_vid);
         if (idx_s < 0) continue;
-
         const uint32_t v_left = t.v[(idx_s + 1) % 3];
         const uint32_t v_right = t.v[(idx_s + 2) % 3];
         const Vec3d& p_left = surface_.vertices_[v_left].Position();
         const Vec3d& p_right = surface_.vertices_[v_right].Position();
-
         const double o_left = ExactPredicates::Orient2D(p_start, p_end, p_left);
         const double o_right = ExactPredicates::Orient2D(p_start, p_end, p_right);
 
@@ -934,7 +900,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
             return InsertConstrainedSegmentInternal(
                 v_left, end_vid, code_id, recorder, recursion_depth + 1);
         }
-
         if (o_left > 0.0 && o_right < 0.0) {
             first_crossed_tri = tid;
             first_exit_slot = idx_s;
@@ -953,7 +918,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
     std::vector<uint32_t> upper_outer_tris;
     std::vector<int> upper_outer_slots;
     std::vector<uint8_t> upper_outer_constrained;
-
     std::vector<uint32_t> lower_chain;
     std::vector<uint32_t> lower_outer_tris;
     std::vector<int> lower_outer_slots;
@@ -964,13 +928,11 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
 
     uint32_t cur_tid = first_crossed_tri;
     int exit_slot = first_exit_slot;
-
     {
         const TinTriangle& t0 = surface_.triangles_[cur_tid];
         const int idx_s = exit_slot;
         const uint32_t v_left = t0.v[(idx_s + 1) % 3];
         const uint32_t v_right = t0.v[(idx_s + 2) % 3];
-
         const int left_slot = (idx_s + 2) % 3;
         const uint32_t nb_left = t0.adj[left_slot];
         upper_outer_tris.push_back(nb_left);
@@ -987,12 +949,10 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
         lower_outer_constrained.push_back(t0.IsEdgeConstrained(right_slot) ? 1 : 0);
         lower_chain.push_back(v_right);
     }
-
     crossed_tris.push_back(cur_tid);
 
     size_t walk_guard = 0;
     const size_t max_walk = surface_.triangles_.size() + 16;
-
     while (walk_guard++ < max_walk) {
         const TinTriangle& cur_t = surface_.triangles_[cur_tid];
         const uint32_t next_tid = cur_t.adj[exit_slot];
@@ -1001,12 +961,11 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
             const Vec3d& ea = surface_.vertices_[cur_t.v[(exit_slot + 1) % 3]].Position();
             const Vec3d& eb = surface_.vertices_[cur_t.v[(exit_slot + 2) % 3]].Position();
             const Vec3d inter_pt = ComputeSegmentIntersection2D(p_start, p_end, ea, eb);
-
+            GEO_LOG_DEBUG("TIN_EDIT", "特征线与已有约束边交叉，自动生成 PSLG 交点 (%.3f, %.3f)", inter_pt.x, inter_pt.y);
             uint32_t split_vid = UINT32_MAX;
             OperationResult ins_res = InsertVertexInternal(
                 inter_pt, 0, code_id, SurveyPoint::kFlagFeature, false, recorder, split_vid);
             if (!ins_res.IsOk()) return ins_res;
-
             OperationResult r1 = InsertConstrainedSegmentInternal(
                 start_vid, split_vid, code_id, recorder, recursion_depth + 1);
             if (!r1.IsOk()) return r1;
@@ -1019,16 +978,13 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
                 StatusCode::kTopologyDegeneracy,
                 "特征线段中途触及三角网外边界空洞，请确保特征线完全位于测区内部");
         }
-
         const TinTriangle& next_t = surface_.triangles_[next_tid];
         const int entry_slot = next_t.IndexOfNeighbor(cur_tid);
         if (entry_slot < 0) {
             return OperationResult::Fail(StatusCode::kInternalError, "特征线穿越行走时邻接关系断裂");
         }
-
         crossed_tris.push_back(next_tid);
         const uint32_t opp_v = next_t.v[entry_slot];
-
         if (opp_v == end_vid) {
             const int last_left_slot = (entry_slot + 1) % 3;
             const uint32_t nb_last_left = next_t.adj[last_left_slot];
@@ -1050,7 +1006,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
 
         const Vec3d& p_opp = surface_.vertices_[opp_v].Position();
         const double orient = ExactPredicates::Orient2D(p_start, p_end, p_opp);
-
         if (std::abs(orient) <= kCollinearEps) {
             OperationResult r1 = InsertConstrainedSegmentInternal(
                 start_vid, opp_v, code_id, recorder, recursion_depth + 1);
@@ -1067,7 +1022,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
                 (nb_left != UINT32_MAX) ? surface_.triangles_[nb_left].IndexOfNeighbor(next_tid) : -1);
             upper_outer_constrained.push_back(next_t.IsEdgeConstrained(left_edge_slot) ? 1 : 0);
             upper_chain.push_back(opp_v);
-
             cur_tid = next_tid;
             exit_slot = (entry_slot + 2) % 3;
         } else {
@@ -1078,7 +1032,6 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
                 (nb_right != UINT32_MAX) ? surface_.triangles_[nb_right].IndexOfNeighbor(next_tid) : -1);
             lower_outer_constrained.push_back(next_t.IsEdgeConstrained(right_edge_slot) ? 1 : 0);
             lower_chain.push_back(opp_v);
-
             cur_tid = next_tid;
             exit_slot = (entry_slot + 1) % 3;
         }
@@ -1124,14 +1077,12 @@ OperationResult TinTopologyEditor::InsertConstrainedSegmentInternal(
         surface_.triangles_[lower_base_tid].adj[lower_base_slot] = upper_base_tid;
         surface_.triangles_[lower_base_tid].SetEdgeConstrained(lower_base_slot, true);
     }
-
     if (code_id != 0) {
         recorder.RecordVertexBefore(start_vid);
         recorder.RecordVertexBefore(end_vid);
         surface_.vertices_[start_vid].code_id = code_id;
         surface_.vertices_[end_vid].code_id = code_id;
     }
-
     return OperationResult::Ok();
 }
 
@@ -1146,8 +1097,10 @@ OperationResult TinTopologyEditor::InsertBreakline(
         return OperationResult::Fail(StatusCode::kInvalidArgument, "特征折线至少需要包含 2 个顶点");
     }
 
-    TransactionRecorder recorder(surface_, "嵌入约束特征线");
+    GEO_LOG_INFO("TIN_EDIT", "开始嵌入强制特征线: nodes=%zu, code=%u, interpZ=%d",
+                 polyline.size(), code_id, interpolate_z_from_tin ? 1 : 0);
 
+    TransactionRecorder recorder(surface_, "嵌入约束特征线");
     std::vector<uint32_t> node_vids;
     node_vids.reserve(polyline.size());
 
@@ -1163,7 +1116,6 @@ OperationResult TinTopologyEditor::InsertBreakline(
             }
             pt.z = z_tin;
         }
-
         uint32_t vid = UINT32_MAX;
         OperationResult ins_res = InsertVertexInternal(
             pt, 0, code_id, SurveyPoint::kFlagFeature, true, recorder, vid);
@@ -1188,6 +1140,7 @@ OperationResult TinTopologyEditor::InsertBreakline(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("TIN_EDIT", "强制特征线嵌入并锁定约束边完成 (%zu 段)", node_vids.size() - 1);
     return OperationResult::Ok();
 }
 
@@ -1213,7 +1166,6 @@ OperationResult TinTopologyEditor::DeleteVertex(uint32_t vertex_id) {
             star_tris.push_back(tid);
         }
     }
-
     if (star_tris.size() < 3) {
         return OperationResult::Fail(
             StatusCode::kTopologyDegeneracy,
@@ -1225,20 +1177,18 @@ OperationResult TinTopologyEditor::DeleteVertex(uint32_t vertex_id) {
     std::vector<uint32_t> outer_tris;
     std::vector<int> outer_slots;
     std::vector<uint8_t> outer_constrained;
-
     uint32_t cur_tid = star_tris[0];
+
     for (size_t step = 0; step < star_tris.size(); ++step) {
         const TinTriangle& t = surface_.triangles_[cur_tid];
         const int slot = t.IndexOfVertex(vertex_id);
         const uint32_t v_next = t.v[(slot + 1) % 3];
         const uint32_t nb_outer = t.adj[slot];
-
         poly_verts.push_back(v_next);
         outer_tris.push_back(nb_outer);
         outer_slots.push_back(
             (nb_outer != UINT32_MAX) ? surface_.triangles_[nb_outer].IndexOfNeighbor(cur_tid) : -1);
         outer_constrained.push_back(t.IsEdgeConstrained(slot) ? 1 : 0);
-
         const uint32_t next_tid = t.adj[(slot + 2) % 3];
         if (next_tid == UINT32_MAX || star_set.find(next_tid) == star_set.end()) {
             return OperationResult::Fail(
@@ -1257,7 +1207,6 @@ OperationResult TinTopologyEditor::DeleteVertex(uint32_t vertex_id) {
     TransactionRecorder recorder(surface_, "删除三角网顶点");
     recorder.RecordVertexBefore(vertex_id);
     surface_.vertices_[vertex_id].flags &= static_cast<uint16_t>(~TinVertex::kFlagActive);
-
     for (uint32_t tid : star_tris) {
         recorder.RecordTriangleBefore(tid);
         surface_.triangles_[tid].is_active = 0;
@@ -1272,6 +1221,7 @@ OperationResult TinTopologyEditor::DeleteVertex(uint32_t vertex_id) {
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("TIN_EDIT", "删除顶点 #%u 并完成 1-邻域空腔重剖分 (星形边数=%zu)", vertex_id, star_tris.size());
     return OperationResult::Ok();
 }
 
@@ -1285,15 +1235,18 @@ OperationResult TinTopologyEditor::ClipByPolygon(
         return OperationResult::Fail(StatusCode::kInvalidArgument, "裁剪多边形至少需要 3 个顶点");
     }
 
+    GEO_LOG_INFO("TIN_EDIT", "开始多边形边界裁剪: poly_pts=%zu, keep_inside=%d",
+                 boundary_polygon.size(), keep_inside ? 1 : 0);
+
     std::vector<Vec3d> closed_ring = boundary_polygon;
     if (closed_ring.front().DistanceSquared2D(closed_ring.back()) > kVertexSnapEpsSq) {
         closed_ring.push_back(closed_ring.front());
     }
 
     TransactionRecorder recorder(surface_, keep_inside ? "多边形外边界裁剪" : "多边形内部挖空裁剪");
-
     std::vector<uint32_t> ring_vids;
     ring_vids.reserve(closed_ring.size());
+
     for (size_t i = 0; i + 1 < closed_ring.size(); ++i) {
         Vec3d pt = closed_ring[i];
         double z_tin = 0.0;
@@ -1304,7 +1257,6 @@ OperationResult TinTopologyEditor::ClipByPolygon(
                 "裁剪多边形存在超出当前三角网覆盖范围的顶点");
         }
         pt.z = z_tin;
-
         uint32_t vid = UINT32_MAX;
         OperationResult res = InsertVertexInternal(
             pt, 0, 0, SurveyPoint::kFlagFeature, true, recorder, vid);
@@ -1316,7 +1268,6 @@ OperationResult TinTopologyEditor::ClipByPolygon(
             ring_vids.push_back(vid);
         }
     }
-
     if (ring_vids.size() < 3) {
         recorder.Rollback();
         return OperationResult::Fail(StatusCode::kInvalidArgument, "去重后裁剪多边形顶点数不足 3 个");
@@ -1332,22 +1283,25 @@ OperationResult TinTopologyEditor::ClipByPolygon(
         }
     }
 
+#if GEO_DEBUG_ENABLED
+    uint64_t clipped_tri_count = 0;
+#endif
     for (uint32_t tid = 0; tid < surface_.triangles_.size(); ++tid) {
         TinTriangle& t = surface_.triangles_[tid];
         if (!t.is_active) continue;
-
         const Vec3d& p0 = surface_.vertices_[t.v[0]].Position();
         const Vec3d& p1 = surface_.vertices_[t.v[1]].Position();
         const Vec3d& p2 = surface_.vertices_[t.v[2]].Position();
         const double cx = (p0.x + p1.x + p2.x) / 3.0;
         const double cy = (p0.y + p1.y + p2.y) / 3.0;
-
         const bool inside = IsPointInPolygon2D(cx, cy, boundary_polygon);
         const bool should_remove = keep_inside ? (!inside) : inside;
-
         if (should_remove) {
             recorder.RecordTriangleBefore(tid);
             t.is_active = 0;
+#if GEO_DEBUG_ENABLED
+            ++clipped_tri_count;
+#endif
             for (int e = 0; e < 3; ++e) {
                 const uint32_t nb = t.adj[e];
                 if (nb != UINT32_MAX && surface_.triangles_[nb].is_active) {
@@ -1364,6 +1318,11 @@ OperationResult TinTopologyEditor::ClipByPolygon(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(BoundingBox3d{});
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO(
+        "TIN_EDIT",
+        "多边形边界裁剪完成: 剔除三角形=%llu, 剩余活跃三角形=%llu",
+        static_cast<unsigned long long>(clipped_tri_count),
+        static_cast<unsigned long long>(surface_.ActiveTriangleCount()));
     return OperationResult::Ok();
 }
 
@@ -1371,9 +1330,9 @@ OperationResult TinTopologyEditor::Undo() {
     if (undo_stack_.empty()) {
         return OperationResult::Fail(StatusCode::kEmptyDataset, "当前没有可撤销的三角网编辑操作");
     }
-
     TinEditTransaction tx = std::move(undo_stack_.back());
     undo_stack_.pop_back();
+    GEO_LOG_INFO("TIN_EDIT", "执行 Undo 撤销操作: [%s]", tx.description.c_str());
 
     for (auto it = tx.triangle_deltas.rbegin(); it != tx.triangle_deltas.rend(); ++it) {
         if (it->triangle_id < surface_.triangles_.size()) {
@@ -1389,7 +1348,6 @@ OperationResult TinTopologyEditor::Undo() {
             surface_.vertices_[it->vertex_id] = it->before_state;
         }
     }
-
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     redo_stack_.push_back(std::move(tx));
     return OperationResult::Ok();
@@ -1399,9 +1357,9 @@ OperationResult TinTopologyEditor::Redo() {
     if (redo_stack_.empty()) {
         return OperationResult::Fail(StatusCode::kEmptyDataset, "当前没有可重做的三角网编辑操作");
     }
-
     TinEditTransaction tx = std::move(redo_stack_.back());
     redo_stack_.pop_back();
+    GEO_LOG_INFO("TIN_EDIT", "执行 Redo 重做操作: [%s]", tx.description.c_str());
 
     for (const auto& vd : tx.vertex_deltas) {
         if (vd.vertex_id >= surface_.vertices_.size()) {
@@ -1415,11 +1373,9 @@ OperationResult TinTopologyEditor::Redo() {
         }
         surface_.triangles_[td.triangle_id] = td.after_state;
     }
-
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     undo_stack_.push_back(std::move(tx));
     return OperationResult::Ok();
 }
 
 }  // namespace geo_kernel
-

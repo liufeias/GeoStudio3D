@@ -1,5 +1,4 @@
 #include "geo_kernel/slope_grading.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -7,14 +6,11 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
 #include "geo_kernel/exact_predicates.hpp"
 #include "geo_kernel/tin_editor.hpp"
 
 namespace geo_kernel {
-
 namespace {
-
 constexpr double kMinSegLen = 1e-5;
 constexpr double kMiterClampFactor = 2.5;
 
@@ -39,7 +35,6 @@ double ComputeSignedArea2D(const std::vector<Vec3d>& poly) noexcept {
 std::vector<Vec3d> NormalizePolygonCCW(const std::vector<Vec3d>& input_poly) {
     std::vector<Vec3d> cleaned;
     cleaned.reserve(input_poly.size());
-
     for (const Vec3d& pt : input_poly) {
         if (cleaned.empty() || cleaned.back().DistanceSquared2D(pt) > kMinSegLen * kMinSegLen) {
             cleaned.push_back(pt);
@@ -51,20 +46,16 @@ std::vector<Vec3d> NormalizePolygonCCW(const std::vector<Vec3d>& input_poly) {
     if (cleaned.size() < 3) {
         return {};
     }
-
     if (ComputeSignedArea2D(cleaned) < 0.0) {
         std::reverse(cleaned.begin(), cleaned.end());
     }
     return cleaned;
 }
 
-/**
- * @brief 对单条原始折线边按指定步长进行均匀加密采样（保留所有原始角点）
- */
 struct DenseStation {
     Vec3d base_pt;              ///< 基准轮廓上的三维坐标
-    Vec3d outward_dir;          ///< 该采样点在基准多边形上的水平外法向（已考虑转角角平分线斜接因子）
-    double miter_scale = 1.0;   ///< 斜接长度放大系数（直边中点为 1.0，转角处为 1/cos(theta/2)）
+    Vec3d outward_dir;          ///< 该采样点在基准多边形上的水平外法向
+    double miter_scale = 1.0;   ///< 斜接长度放大系数
     bool is_corner = false;     ///< 是否为原始多边形角点
 };
 
@@ -77,10 +68,8 @@ std::vector<DenseStation> BuildDenseProfileStations(
     const size_t n = ccw_poly.size();
     std::vector<DenseStation> stations;
     if (n < 3) return stations;
-
     const double step = std::max(0.25, sample_step);
 
-    // 预计算每条逆时针边的单位右手法向（即多边形外法向）
     std::vector<Vec3d> edge_out_normals(n);
     std::vector<double> edge_lengths(n);
     for (size_t i = 0; i < n; ++i) {
@@ -97,7 +86,6 @@ std::vector<DenseStation> BuildDenseProfileStations(
         }
     }
 
-    // 计算每个原始角点的角平分外法向与斜接比例
     std::vector<Vec3d> corner_dirs(n);
     std::vector<double> corner_scales(n, 1.0);
     for (size_t i = 0; i < n; ++i) {
@@ -105,7 +93,6 @@ std::vector<DenseStation> BuildDenseProfileStations(
         const size_t next_edge = i;
         const Vec3d& n0 = edge_out_normals[prev_edge];
         const Vec3d& n1 = edge_out_normals[next_edge];
-
         Vec3d bisector{n0.x + n1.x, n0.y + n1.y, 0.0};
         const double b_len = std::hypot(bisector.x, bisector.y);
         if (b_len > 1e-9) {
@@ -120,13 +107,11 @@ std::vector<DenseStation> BuildDenseProfileStations(
         }
     }
 
-    // 沿每条边按 step 均匀插入中间站点
     for (size_t i = 0; i < n; ++i) {
         const Vec3d& a = ccw_poly[i];
         const Vec3d& b = ccw_poly[(i + 1) % n];
         const double len = edge_lengths[i];
         const int subdivs = std::max(1, static_cast<int>(std::ceil(len / step)));
-
         for (int s = 0; s < subdivs; ++s) {
             const double t = static_cast<double>(s) / static_cast<double>(subdivs);
             DenseStation st{};
@@ -147,18 +132,11 @@ std::vector<DenseStation> BuildDenseProfileStations(
             stations.push_back(st);
         }
     }
-
     return stations;
 }
 
 /**
  * @brief 计算多边形环的水平偏置并消解局部自相交折叠（适用于向内收缩与凹角外扩）
- * @param ring 当前多边形三维顶点环
- * @param station_dirs 每个顶点对应的单位偏置方向（向外为 +outward_dir，向内为 -outward_dir）
- * @param station_scales 每个顶点的斜接缩放因子
- * @param signed_offset_dist 带符号垂直距离偏置（>0 向外扩展，<0 向内收缩）
- * @param delta_z 本次水平偏置伴随的高程变化量（米）
- * @param out_collapsed 输出标志：若向内收缩导致多边形面积完全坍缩消失，置为 true
  */
 std::vector<Vec3d> ComputeCleanOffsetRing(
     const std::vector<Vec3d>& ring,
@@ -170,11 +148,9 @@ std::vector<Vec3d> ComputeCleanOffsetRing(
     out_collapsed = false;
     const size_t n = ring.size();
     std::vector<Vec3d> next_ring(n);
-
     const double abs_dist = std::abs(signed_offset_dist);
     const double dir_sign = (signed_offset_dist >= 0.0) ? 1.0 : -1.0;
 
-    // 1. 计算初始斜接偏置顶点
     for (size_t i = 0; i < n; ++i) {
         const double move = dir_sign * abs_dist * station_scales[i];
         next_ring[i] = {
@@ -184,12 +160,9 @@ std::vector<Vec3d> ComputeCleanOffsetRing(
         };
     }
 
-    // 2. 检测向内收缩或凹角外扩时相邻边翻转导致的局部自相交折叠，并投影拉平消解交叉
     if (n >= 4 && abs_dist > 1e-6) {
         const double orig_area = ComputeSignedArea2D(ring);
         const double new_area = ComputeSignedArea2D(next_ring);
-
-        // 若整体面积翻转或缩小至不足原面积的 1%，判定向内收缩已到达中心闭合极限
         if (signed_offset_dist < 0.0 && (new_area <= 1e-3 || new_area < orig_area * 0.01)) {
             out_collapsed = true;
             Vec3d centroid{0.0, 0.0, 0.0};
@@ -204,15 +177,12 @@ std::vector<Vec3d> ComputeCleanOffsetRing(
             return next_ring;
         }
 
-        // 局部边翻转消解（迭代修正因短边过冲导致的局部蝴蝶结自相交）
         for (int iter = 0; iter < 4; ++iter) {
             bool fixed_any = false;
             for (size_t i = 0; i < n; ++i) {
                 const size_t j = (i + 1) % n;
                 const Vec3d orig_e{ring[j].x - ring[i].x, ring[j].y - ring[i].y, 0.0};
                 const Vec3d new_e{next_ring[j].x - next_ring[i].x, next_ring[j].y - next_ring[i].y, 0.0};
-
-                // 若偏置后边方向与原边方向发生 >135 度反向翻转，说明该短边已收缩过头发生自交
                 if (orig_e.x * new_e.x + orig_e.y * new_e.y < -0.5 * orig_e.LengthSquared()) {
                     const Vec3d mid{
                         0.5 * (next_ring[i].x + next_ring[j].x),
@@ -227,7 +197,6 @@ std::vector<Vec3d> ComputeCleanOffsetRing(
             if (!fixed_any) break;
         }
     }
-
     return next_ring;
 }
 
@@ -241,8 +210,6 @@ void TriangulateFlatPolygon(
     std::vector<TinTriangle>& out_triangles) {
     const size_t n = ring_vertex_ids.size();
     if (n < 3) return;
-
-    // 过滤相邻重合顶点
     std::vector<uint32_t> poly;
     poly.reserve(n);
     for (uint32_t vid : ring_vertex_ids) {
@@ -265,7 +232,6 @@ void TriangulateFlatPolygon(
     }
     if (poly.size() < 3) return;
 
-    // 统一规范为逆时针方向
     double area2 = 0.0;
     for (size_t i = 0; i < poly.size(); ++i) {
         const Vec3d& p0 = all_vertices[poly[i]].Position();
@@ -284,15 +250,12 @@ void TriangulateFlatPolygon(
         for (size_t i = 0; i < m; ++i) {
             const size_t prev_i = (i + m - 1) % m;
             const size_t next_i = (i + 1) % m;
-
             const Vec3d& pa = all_vertices[poly[prev_i]].Position();
             const Vec3d& pb = all_vertices[poly[i]].Position();
             const Vec3d& pc = all_vertices[poly[next_i]].Position();
-
             if (ExactPredicates::Orient2D(pa, pb, pc) <= 1e-10) {
                 continue;
             }
-
             bool has_inside = false;
             for (size_t k = 0; k < m; ++k) {
                 if (k == prev_i || k == i || k == next_i) continue;
@@ -312,13 +275,11 @@ void TriangulateFlatPolygon(
             tri.region_tag = region_tag;
             tri.is_active = 1;
             out_triangles.push_back(tri);
-
             poly.erase(poly.begin() + static_cast<std::ptrdiff_t>(i));
             clipped = true;
             break;
         }
         if (!clipped) {
-            // 若遇到微弱退化凹角，使用扇形兜底闭合剩余多边形
             for (size_t k = 1; k + 1 < poly.size(); ++k) {
                 const Vec3d& p0 = all_vertices[poly[0]].Position();
                 const Vec3d& p1 = all_vertices[poly[k]].Position();
@@ -336,7 +297,6 @@ void TriangulateFlatPolygon(
             return;
         }
     }
-
     if (poly.size() == 3) {
         const Vec3d& p0 = all_vertices[poly[0]].Position();
         const Vec3d& p1 = all_vertices[poly[1]].Position();
@@ -353,9 +313,6 @@ void TriangulateFlatPolygon(
     }
 }
 
-/**
- * @brief 计算空间三角形的三维表面积
- */
 double TriangleArea3D(const Vec3d& a, const Vec3d& b, const Vec3d& c) noexcept {
     return 0.5 * (b - a).Cross(c - a).Length();
 }
@@ -373,8 +330,6 @@ bool IntersectSegmentWithTerrain(
     if (seg_len <= 1e-9) {
         return false;
     }
-
-    // 步进检测（步长 0.25m，至少 4 段），捕获起伏地形上的首个符号翻转区间
     const int steps = std::max(4, static_cast<int>(std::ceil(seg_len / 0.25)));
     double prev_t = 0.0;
     double prev_diff = 0.0;
@@ -394,10 +349,8 @@ bool IntersectSegmentWithTerrain(
             p_from.y + curr_t * (p_to.y - p_from.y),
             p_from.z + curr_t * (p_to.z - p_from.z)
         };
-
         double z_ground = 0.0;
         if (!terrain.QueryElevationAt(curr_p.x, curr_p.y, z_ground, nullptr)) {
-            // 超出原地面三角网范围：在边界前一个有效位置截断
             out_hit_pt = {
                 p_from.x + prev_t * (p_to.x - p_from.x),
                 p_from.y + prev_t * (p_to.y - p_from.y),
@@ -405,23 +358,18 @@ bool IntersectSegmentWithTerrain(
             };
             return true;
         }
-
         const double curr_diff = curr_p.z - z_ground;
-        // 检查是否发生穿透（符号相反或已贴近原地面 1e-4m 以内）
         if ((prev_diff > 0.0 && curr_diff <= 0.0) ||
             (prev_diff < 0.0 && curr_diff >= 0.0) ||
             std::abs(curr_diff) <= 1e-4) {
             double lo = prev_t;
             double hi = curr_t;
             double lo_diff = prev_diff;
-
-            // 18 次二分求根，精度可达 0.25 / 2^18 ≈ 1 微米
             for (int iter = 0; iter < 18; ++iter) {
                 const double mid = 0.5 * (lo + hi);
                 const double mx = p_from.x + mid * (p_to.x - p_from.x);
                 const double my = p_from.y + mid * (p_to.y - p_from.y);
                 const double mz = p_from.z + mid * (p_to.z - p_from.z);
-
                 double gz = 0.0;
                 if (!terrain.QueryElevationAt(mx, my, gz, nullptr)) {
                     hi = mid;
@@ -435,32 +383,27 @@ bool IntersectSegmentWithTerrain(
                     hi = mid;
                 }
             }
-
             const double final_t = 0.5 * (lo + hi);
             const double fx = p_from.x + final_t * (p_to.x - p_from.x);
             const double fy = p_from.y + final_t * (p_to.y - p_from.y);
             double fz = p_from.z + final_t * (p_to.z - p_from.z);
             double exact_gz = fz;
             if (terrain.QueryElevationAt(fx, fy, exact_gz, nullptr)) {
-                fz = exact_gz;  // 严格吸附到原地面 TIN 高程上，消除缝合缝隙
+                fz = exact_gz;
             }
             out_hit_pt = {fx, fy, fz};
             return true;
         }
-
         prev_t = curr_t;
         prev_diff = curr_diff;
     }
-
     return false;
 }
-
 }  // namespace
 
 // ==============================================================================
 // SlopeGradingEngine 完整多级放坡建模与地形缝合实现
 // ==============================================================================
-
 OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
     const TiledTinSurface& original_terrain,
     const MultiStageGradingOptions& options,
@@ -493,13 +436,23 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                 "第 " + std::to_string(s + 1) + " 级放坡参数非法（坡高必须 > 0，坡比和马道宽度不能为负）");
         }
     }
-
     if ((options.auto_daylight_to_terrain || out_merged_terrain != nullptr) &&
         !original_terrain.IsValid()) {
         return OperationResult::Fail(
             StatusCode::kEmptyDataset,
             "启用原地面求交或地形缝合时，第一期原地面三角网不能为空");
     }
+
+    GEO_LOG_INFO(
+        "GRADING",
+        "启动多级放坡建模: dir=%d, vmode=%d, base_pts=%zu, stages=%zu, auto_daylight=%d, stitch=%d, step=%.2fm",
+        static_cast<int>(options.direction),
+        static_cast<int>(options.vertical_mode),
+        options.base_polygon.size(),
+        options.stages.size(),
+        options.auto_daylight_to_terrain ? 1 : 0,
+        out_merged_terrain != nullptr ? 1 : 0,
+        options.perimeter_sample_step);
 
     ExactPredicates::Initialize();
 
@@ -510,13 +463,11 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
             StatusCode::kInvalidArgument,
             "基准轮廓多边形去重后有效顶点数不足 3 个");
     }
-
     if (options.use_uniform_base_elevation) {
         for (auto& pt : ccw_base) {
             pt.z = options.base_elevation;
         }
     }
-
     out_result.base_pad_area_m2 = std::abs(ComputeSignedArea2D(ccw_base));
 
     // 3. 沿基准轮廓加密剖面站点
@@ -534,7 +485,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         } else if (options.vertical_mode == GradingVerticalMode::kSlopeDown) {
             station_v_signs[i] = -1.0;
         } else {
-            // 自动挖填模式：与原地面高程比较
             double z_ground = stations[i].base_pt.z;
             if (original_terrain.IsValid() &&
                 original_terrain.QueryElevationAt(stations[i].base_pt.x, stations[i].base_pt.y, z_ground, nullptr)) {
@@ -544,16 +494,14 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
             }
         }
     }
-
     const double h_dir_sign = (options.direction == GradingDirection::kOutward) ? 1.0 : -1.0;
 
-    // 4. 逐级构建放坡轮廓环序列（Ring 0 为基准轮廓，每级包含：坡面终环 + 可选马道外环）
+    // 4. 逐级构建放坡轮廓环序列
     struct ProfileRing {
         std::vector<Vec3d> pts;
-        uint16_t region_tag = 0;    ///< 与前一层之间条带的区域属性（1=填方坡，2=挖方坡，3=马道）
+        uint16_t region_tag = 0;
         bool is_berm_ring = false;
     };
-
     std::vector<ProfileRing> rings;
     rings.reserve(options.stages.size() * 2 + 1);
 
@@ -572,7 +520,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         station_scales[i] = stations[i].miter_scale;
     }
 
-    // 记录每个剖面站点是否已在某一级提前与原地面相交截断（Daylighted）
     std::vector<bool> station_daylighted(num_stations, false);
     std::vector<Vec3d> station_daylight_pt(num_stations);
     for (size_t i = 0; i < num_stations; ++i) {
@@ -581,11 +528,8 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
 
     bool inward_collapsed = false;
     uint32_t stages_executed = 0;
-
     for (size_t s_idx = 0; s_idx < options.stages.size(); ++s_idx) {
         if (inward_collapsed) break;
-
-        // 检查是否所有站点均已与原地面相交
         bool all_hit = true;
         for (size_t i = 0; i < num_stations; ++i) {
             if (!station_daylighted[i]) {
@@ -594,9 +538,9 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
             }
         }
         if (options.auto_daylight_to_terrain && all_hit) {
+            GEO_LOG_DEBUG("GRADING", "全部 %zu 个站点已提前与原地面求交收敛，在第 %zu 级提前结束", num_stations, s_idx);
             break;
         }
-
         const SlopeStageSpec& spec = options.stages[s_idx];
         ++stages_executed;
 
@@ -612,25 +556,21 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
             avg_v_sign * spec.stage_height,
             collapsed_now);
 
-        // 针对各站点可能不同的挖填符号（自动挖填模式）精确修正高程
         for (size_t i = 0; i < num_stations; ++i) {
             raw_slope_ring[i].z = rings.back().pts[i].z + station_v_signs[i] * spec.stage_height;
         }
 
         ProfileRing slope_ring{};
         slope_ring.pts.resize(num_stations);
-        slope_ring.region_tag = (avg_v_sign < 0.0) ? 1 : 2;  // 1=填方边坡，2=挖方边坡
+        slope_ring.region_tag = (avg_v_sign < 0.0) ? 1 : 2;
         slope_ring.is_berm_ring = false;
-
         for (size_t i = 0; i < num_stations; ++i) {
             if (station_daylighted[i]) {
                 slope_ring.pts[i] = station_daylight_pt[i];
                 continue;
             }
-
             const Vec3d& p_prev = rings.back().pts[i];
             const Vec3d& p_cand = raw_slope_ring[i];
-
             if (options.auto_daylight_to_terrain) {
                 Vec3d hit_pt{};
                 if (IntersectSegmentWithTerrain(
@@ -641,13 +581,12 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                     continue;
                 }
             }
-
             slope_ring.pts[i] = p_cand;
             station_daylight_pt[i] = p_cand;
         }
-
         rings.push_back(std::move(slope_ring));
         if (collapsed_now) {
+            GEO_LOG_WARN("GRADING", "向内放坡在第 %zu 级边坡处中心收缩坍缩，停止继续内收", s_idx + 1);
             inward_collapsed = true;
             break;
         }
@@ -667,18 +606,15 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
 
             ProfileRing berm_ring{};
             berm_ring.pts.resize(num_stations);
-            berm_ring.region_tag = 3;  // 3=马道平台
+            berm_ring.region_tag = 3;
             berm_ring.is_berm_ring = true;
-
             for (size_t i = 0; i < num_stations; ++i) {
                 if (station_daylighted[i]) {
                     berm_ring.pts[i] = station_daylight_pt[i];
                     continue;
                 }
-
                 const Vec3d& p_prev = rings.back().pts[i];
                 const Vec3d& p_cand = raw_berm_ring[i];
-
                 if (options.auto_daylight_to_terrain) {
                     Vec3d hit_pt{};
                     if (IntersectSegmentWithTerrain(
@@ -689,13 +625,12 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                         continue;
                     }
                 }
-
                 berm_ring.pts[i] = p_cand;
                 station_daylight_pt[i] = p_cand;
             }
-
             rings.push_back(std::move(berm_ring));
             if (berm_collapsed) {
+                GEO_LOG_WARN("GRADING", "向内放坡在第 %zu 级马道处中心收缩坍缩，停止继续内收", s_idx + 1);
                 inward_collapsed = true;
                 break;
             }
@@ -703,8 +638,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
     }
 
     out_result.actual_stages_used = stages_executed;
-
-    // 统计是否全部站点均已与原地面收敛相交，并提取封闭坡脚线/开挖边线
     size_t daylighted_count = 0;
     for (size_t i = 0; i < num_stations; ++i) {
         if (station_daylighted[i]) ++daylighted_count;
@@ -721,7 +654,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         }
     }
     if (!out_result.daylight_polyline.empty()) {
-        // 闭合坡脚线首尾
         out_result.daylight_polyline.push_back(out_result.daylight_polyline.front());
         for (size_t i = 0; i + 1 < out_result.daylight_polyline.size(); ++i) {
             out_result.daylight_perimeter_m +=
@@ -729,13 +661,12 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         }
     }
 
-    // 5. 构建纯放坡设计面三维网格（顶点 + 基底三角网 + 各级坡面/马道条带三角网 + 可选内收封底）
+    // 5. 构建纯放坡设计面三维网格
     std::vector<TinVertex> mesh_vertices;
     std::vector<TinTriangle> mesh_triangles;
     mesh_vertices.reserve(rings.size() * num_stations + 16);
     mesh_triangles.reserve(rings.size() * num_stations * 2 + num_stations);
 
-    // 5.1 写入所有环的顶点（共享环顶点实现拓扑水密连接）
     std::vector<std::vector<uint32_t>> ring_vids(rings.size(), std::vector<uint32_t>(num_stations));
     for (size_t r = 0; r < rings.size(); ++r) {
         for (size_t i = 0; i < num_stations; ++i) {
@@ -745,48 +676,39 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
             v.y = rings[r].pts[i].y;
             v.z = rings[r].pts[i].z;
             v.source_point_id = vid + 1;
-            v.code_id = (r == rings.size() - 1) ? 102 : 101;  // 101=设计边坡点, 102=坡脚线点
+            v.code_id = (r == rings.size() - 1) ? 102 : 101;
             v.flags = SurveyPoint::kFlagValid | SurveyPoint::kFlagFeature;
             mesh_vertices.push_back(v);
             ring_vids[r][i] = vid;
         }
     }
 
-    // 5.2 生成基准设计平台（Ring 0）内部平面三角网（仅当向外放坡时，Ring 0 为设计平台内部）
     if (options.direction == GradingDirection::kOutward) {
         TriangulateFlatPolygon(ring_vids[0], mesh_vertices, 4, mesh_triangles);
     }
 
-    // 5.3 逐层连接相邻两个轮廓环 (r -> r+1) 生成边坡斜面或马道平台四边形条带
     double total_slope_area_3d = 0.0;
     double total_berm_area_3d = 0.0;
-
     for (size_t r = 0; r + 1 < rings.size(); ++r) {
         const uint16_t strip_tag = rings[r + 1].region_tag;
         const bool is_berm = rings[r + 1].is_berm_ring;
-
         for (size_t i = 0; i < num_stations; ++i) {
             const size_t next_i = (i + 1) % num_stations;
-
             const uint32_t v00 = ring_vids[r][i];
             const uint32_t v01 = ring_vids[r][next_i];
             const uint32_t v11 = ring_vids[r + 1][next_i];
             const uint32_t v10 = ring_vids[r + 1][i];
-
             const Vec3d& p00 = mesh_vertices[v00].Position();
             const Vec3d& p01 = mesh_vertices[v01].Position();
             const Vec3d& p11 = mesh_vertices[v11].Position();
             const Vec3d& p10 = mesh_vertices[v10].Position();
 
-            // 跳过已完全贴合原地面而退化为零宽度的带段
             const bool edge0_degen = (p00.DistanceSquared2D(p10) <= 1e-10);
             const bool edge1_degen = (p01.DistanceSquared2D(p11) <= 1e-10);
             if (edge0_degen && edge1_degen) {
                 continue;
             }
-
             if (edge0_degen) {
-                // 退化为单三角形 (v00, v01, v11)
                 if (std::abs(ExactPredicates::Orient2D(p00, p01, p11)) > 1e-10) {
                     TinTriangle t{};
                     t.v[0] = v00; t.v[1] = v01; t.v[2] = v11;
@@ -798,7 +720,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                     else total_slope_area_3d += a3d;
                 }
             } else if (edge1_degen) {
-                // 退化为单三角形 (v00, v01, v10)
                 if (std::abs(ExactPredicates::Orient2D(p00, p01, p10)) > 1e-10) {
                     TinTriangle t{};
                     t.v[0] = v00; t.v[1] = v01; t.v[2] = v10;
@@ -810,7 +731,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                     else total_slope_area_3d += a3d;
                 }
             } else {
-                // 常规四边形条带 (v00, v01, v11, v10) 剖分为两个三角形
                 if (std::abs(ExactPredicates::Orient2D(p00, p01, p11)) > 1e-10) {
                     TinTriangle t1{};
                     t1.v[0] = v00; t1.v[1] = v01; t1.v[2] = v11;
@@ -835,7 +755,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         }
     }
 
-    // 5.4 若为向内放坡（如基坑开挖）且未发生中心坍缩，生成坑底封底平台
     if (options.direction == GradingDirection::kInward &&
         options.cap_inward_bottom &&
         !inward_collapsed &&
@@ -846,7 +765,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
     out_result.slope_surface_area_m2 = total_slope_area_3d;
     out_result.berm_surface_area_m2 = total_berm_area_3d;
 
-    // 拷贝一份顶点和三角形备用（用于后续与原地面缝合）
     std::vector<TinVertex> grading_verts_copy = mesh_vertices;
     std::vector<TinTriangle> grading_tris_copy = mesh_triangles;
 
@@ -858,36 +776,29 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         return build_res;
     }
 
-    // 6. 若需要生成与原地面无缝缝合的完整设计地形（out_merged_terrain）
+    // 6. 生成与原地面无缝缝合的完整设计地形（out_merged_terrain）
     if (out_merged_terrain != nullptr && original_terrain.IsValid()) {
-        // 确定最外围封闭边界（向外放坡为坡脚线，向内放坡为基坑开挖顶口线）
         const std::vector<Vec3d>& outer_seam_poly =
             (options.direction == GradingDirection::kOutward) ? outer_ring_pts : ccw_base;
-
-        // 拷贝原地面 TIN 并沿封闭边界抠除内部区域
         *out_merged_terrain = original_terrain;
         TinTopologyEditor clipper(*out_merged_terrain);
         OperationResult clip_res = clipper.ClipByPolygon(outer_seam_poly, /*keep_inside=*/false);
-
         if (clip_res.IsOk()) {
             std::vector<TinVertex> merged_verts = out_merged_terrain->Vertices();
             std::vector<TinTriangle> merged_tris;
             merged_tris.reserve(
                 out_merged_terrain->ActiveTriangleCount() + grading_tris_copy.size());
-
             for (const auto& t : out_merged_terrain->Triangles()) {
                 if (t.is_active) {
                     merged_tris.push_back(t);
                 }
             }
 
-            // 建立接缝边缘顶点空间哈希吸附表（容差 1e-4m），确保放坡网格与裁剪后原地面共用节点
             auto snap_key = [](double x, double y) noexcept -> uint64_t {
                 const auto ix = static_cast<int64_t>(std::llround(x * 10000.0));
                 const auto iy = static_cast<int64_t>(std::llround(y * 10000.0));
                 return (static_cast<uint64_t>(ix) << 32) ^ static_cast<uint64_t>(iy);
             };
-
             std::unordered_map<uint64_t, uint32_t> seam_vertex_map;
             seam_vertex_map.reserve(merged_verts.size());
             for (uint32_t vid = 0; vid < merged_verts.size(); ++vid) {
@@ -911,7 +822,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                     g_to_m_vid[g_vid] = new_m_vid;
                 }
             }
-
             for (const auto& gt : grading_tris_copy) {
                 if (!gt.is_active) continue;
                 TinTriangle mt = gt;
@@ -920,7 +830,6 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
                 mt.v[2] = g_to_m_vid[gt.v[2]];
                 merged_tris.push_back(mt);
             }
-
             OperationResult stitch_res = out_merged_terrain->BuildFromCustomMesh(
                 std::move(merged_verts),
                 std::move(merged_tris),
@@ -928,6 +837,15 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
             if (!stitch_res.IsOk()) {
                 return stitch_res;
             }
+            GEO_LOG_INFO(
+                "GRADING",
+                "放坡与原地面无缝缝合成功: merged_tris=%llu",
+                static_cast<unsigned long long>(out_merged_terrain->ActiveTriangleCount()));
+        } else {
+            GEO_LOG_WARN(
+                "GRADING",
+                "原地面按坡脚线裁剪失败 (已跳过缝合输出): %s",
+                clip_res.message.c_str());
         }
     }
 
@@ -941,15 +859,28 @@ OperationResult SlopeGradingEngine::GenerateMultiStageGrading(
         OperationResult ew_res = ew_calc.ComputeExactTinToTinVolume(
             original_terrain, out_grading_surface, ew_opts, out_result.earthwork);
         if (!ew_res.IsOk()) {
-            // 若重叠面积极小（如纯悬空设计），保留零值报告而非报错中断
+            GEO_LOG_WARN("GRADING", "放坡面与原地面无有效水平投影重叠，土方量报告置零: %s", ew_res.message.c_str());
             out_result.earthwork = EarthworkReport{};
         }
     }
 
     const auto end_tp = std::chrono::steady_clock::now();
     out_result.elapsed_seconds = std::chrono::duration<double>(end_tp - start_tp).count();
+
+    GEO_LOG_INFO(
+        "GRADING",
+        "多级放坡建模汇总: stations=%zu (daylighted=%zu, converged=%d), stages=%u, perim=%.2fm, slope_area=%.2fm2, berm_area=%.2fm2, fill=%.2fm3, cut=%.2fm3, elapsed=%.4fs",
+        num_stations,
+        daylighted_count,
+        out_result.daylight_converged ? 1 : 0,
+        out_result.actual_stages_used,
+        out_result.daylight_perimeter_m,
+        out_result.slope_surface_area_m2,
+        out_result.berm_surface_area_m2,
+        out_result.earthwork.fill_volume_m3,
+        out_result.earthwork.cut_volume_m3,
+        out_result.elapsed_seconds);
     return OperationResult::Ok();
 }
 
 }  // namespace geo_kernel
-

@@ -1,6 +1,10 @@
 #include "geo_kernel/geo_kernel_c_api.h"
-
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -9,7 +13,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "geo_kernel/core_types.hpp"
 #include "geo_kernel/dat_parser.hpp"
 #include "geo_kernel/earthwork_calculator.hpp"
@@ -19,14 +22,217 @@
 #include "geo_kernel/tiled_tin.hpp"
 #include "geo_kernel/tin_editor.hpp"
 
+#if defined(_WIN32) && GEO_DEBUG_ENABLED
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+#endif
+
+// ==============================================================================
+// C++20 跨平台线程安全 Debug 日志落盘实现（Release 编译期为空桩，零开销）
+// ==============================================================================
+namespace geo_kernel {
+
+#if GEO_DEBUG_ENABLED
 namespace {
 
-constexpr int32_t kMaxSurfaceSlots = 4;
+std::mutex g_kernel_log_mutex;
+std::FILE* g_kernel_log_file = nullptr;
+bool g_kernel_log_init_attempted = false;
+std::atomic<uint32_t> g_next_thread_seq{1};
+thread_local uint32_t g_tls_thread_seq = 0;
 
+uint32_t GetShortThreadSeq() noexcept {
+    if (g_tls_thread_seq == 0) {
+        g_tls_thread_seq = g_next_thread_seq.fetch_add(1, std::memory_order_relaxed);
+    }
+    return g_tls_thread_seq;
+}
+
+const char* ExtractShortFileName(const char* path) noexcept {
+    if (path == nullptr) return "unknown";
+    const char* last_fwd = std::strrchr(path, '/');
+    const char* last_bck = std::strrchr(path, '\\');
+    const char* best = (last_fwd > last_bck) ? last_fwd : last_bck;
+    return (best != nullptr) ? (best + 1) : path;
+}
+
+const char* LevelToTag(DebugLogLevel level) noexcept {
+    switch (level) {
+        case DebugLogLevel::kDebug: return "DEBUG";
+        case DebugLogLevel::kInfo:  return "INFO ";
+        case DebugLogLevel::kWarn:  return "WARN ";
+        case DebugLogLevel::kError: return "ERROR";
+    }
+    return "INFO ";
+}
+
+void EnsureKernelLogFileOpenedLocked() noexcept {
+    if (g_kernel_log_init_attempted) {
+        return;
+    }
+    g_kernel_log_init_attempted = true;
+    try {
+        std::error_code ec;
+        std::filesystem::path log_dir = std::filesystem::current_path(ec) / "logs";
+        if (ec || !std::filesystem::create_directories(log_dir, ec)) {
+            if (ec) {
+                log_dir = std::filesystem::temp_directory_path(ec) / "GeoStudio3D_logs";
+                std::filesystem::create_directories(log_dir, ec);
+            }
+        }
+        const std::filesystem::path log_path = log_dir / "GeoKernelCore_cpp_debug.log";
+#if defined(_WIN32)
+        g_kernel_log_file = _wfopen(log_path.c_str(), L"a, ccs=UTF-8");
+        if (g_kernel_log_file == nullptr) {
+            g_kernel_log_file = _wfopen(log_path.c_str(), L"a");
+        }
+#else
+        g_kernel_log_file = std::fopen(log_path.c_str(), "a");
+#endif
+    } catch (...) {
+        g_kernel_log_file = nullptr;
+    }
+}
+
+void FormatLocalTimestamp(char out_buf[32]) noexcept {
+    const auto now = std::chrono::system_clock::now();
+    const auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    const int millis = static_cast<int>(ms_total.count() % 1000);
+    const std::time_t now_t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &now_t);
+#else
+    localtime_r(&now_t, &tm_buf);
+#endif
+    std::snprintf(
+        out_buf,
+        32,
+        "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+        tm_buf.tm_year + 1900,
+        tm_buf.tm_mon + 1,
+        tm_buf.tm_mday,
+        tm_buf.tm_hour,
+        tm_buf.tm_min,
+        tm_buf.tm_sec,
+        millis);
+}
+
+}  // namespace
+
+void GeoKernelWriteDebugLog(
+    DebugLogLevel level,
+    const char* module,
+    const char* file,
+    int line,
+    const char* func,
+    const char* fmt,
+    ...) noexcept {
+    try {
+        char ts_buf[32];
+        FormatLocalTimestamp(ts_buf);
+
+        char stack_msg[1024];
+        std::string heap_msg;
+        const char* msg_ptr = stack_msg;
+
+        if (fmt != nullptr) {
+            va_list args;
+            va_start(args, fmt);
+            va_list args_copy;
+            va_copy(args_copy, args);
+            const int needed = std::vsnprintf(stack_msg, sizeof(stack_msg), fmt, args);
+            va_end(args);
+
+            if (needed >= static_cast<int>(sizeof(stack_msg))) {
+                heap_msg.resize(static_cast<size_t>(needed) + 1);
+                std::vsnprintf(heap_msg.data(), heap_msg.size(), fmt, args_copy);
+                msg_ptr = heap_msg.c_str();
+            } else if (needed < 0) {
+                std::snprintf(stack_msg, sizeof(stack_msg), "<日志格式化失败>");
+            }
+            va_end(args_copy);
+        } else {
+            stack_msg[0] = '\0';
+        }
+
+        const uint32_t tid = GetShortThreadSeq();
+        const char* short_file = ExtractShortFileName(file);
+        const char* safe_mod = (module != nullptr) ? module : "CORE";
+        const char* safe_func = (func != nullptr) ? func : "";
+
+        std::lock_guard<std::mutex> lock(g_kernel_log_mutex);
+        std::fprintf(
+            stderr,
+            "[%s] [%s] [T%u] [CPP:%s] (%s:%d %s) %s\n",
+            ts_buf,
+            LevelToTag(level),
+            tid,
+            safe_mod,
+            short_file,
+            line,
+            safe_func,
+            msg_ptr);
+
+        EnsureKernelLogFileOpenedLocked();
+        if (g_kernel_log_file != nullptr) {
+            std::fprintf(
+                g_kernel_log_file,
+                "[%s] [%s] [T%u] [CPP:%s] (%s:%d %s) %s\n",
+                ts_buf,
+                LevelToTag(level),
+                tid,
+                safe_mod,
+                short_file,
+                line,
+                safe_func,
+                msg_ptr);
+            std::fflush(g_kernel_log_file);
+        }
+
+#if defined(_WIN32)
+        char dbg_line[1280];
+        std::snprintf(
+            dbg_line,
+            sizeof(dbg_line),
+            "[%s] [%s] [CPP:%s] %s\n",
+            ts_buf,
+            LevelToTag(level),
+            safe_mod,
+            msg_ptr);
+        OutputDebugStringA(dbg_line);
+#endif
+    } catch (...) {
+        // 日志通道绝对不允许向业务层抛出任何异常
+    }
+}
+#else
+void GeoKernelWriteDebugLog(
+    DebugLogLevel,
+    const char*,
+    const char*,
+    int,
+    const char*,
+    const char*,
+    ...) noexcept {
+    // Release 构建：空实现，保证 ABI 符号完整且零运行时开销
+}
+#endif  // GEO_DEBUG_ENABLED
+
+}  // namespace geo_kernel
+
+// ==============================================================================
+// C ABI 会话管理与错误诊断实现
+// ==============================================================================
+namespace {
+constexpr int32_t kMaxSurfaceSlots = 4;
 thread_local std::string g_last_error_message;
 
 void SetLastError(const std::string& msg) {
     g_last_error_message = msg;
+    GEO_LOG_ERROR("C_API", "SetLastError -> %s", msg.c_str());
 }
 
 void ClearLastError() {
@@ -83,7 +289,6 @@ void FillEarthworkSummary(
     out_sum.intersected_prisms = rep.intersected_prisms;
     out_sum.elapsed_seconds = rep.elapsed_seconds;
 }
-
 }  // namespace
 
 struct GeoProjectOpaque {
@@ -93,7 +298,6 @@ struct GeoProjectOpaque {
 };
 
 namespace {
-
 bool ValidateProjectAndSlot(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -114,7 +318,6 @@ bool ValidateProjectAndSlot(
 GeoStatus MapStatus(geo_kernel::StatusCode code) noexcept {
     return static_cast<GeoStatus>(static_cast<int32_t>(code));
 }
-
 }  // namespace
 
 extern "C" {
@@ -131,7 +334,9 @@ GeoProjectHandle geo_project_create(void) {
     try {
         geo_kernel::ExactPredicates::Initialize();
         ClearLastError();
-        return new GeoProjectOpaque();
+        auto* proj = new GeoProjectOpaque();
+        GEO_LOG_INFO("C_API", "geo_project_create 创建工程上下文成功: ptr=%p", static_cast<void*>(proj));
+        return proj;
     } catch (...) {
         SetLastError("创建工程实例时内存分配失败");
         return nullptr;
@@ -139,6 +344,7 @@ GeoProjectHandle geo_project_create(void) {
 }
 
 void geo_project_destroy(GeoProjectHandle handle) {
+    GEO_LOG_INFO("C_API", "geo_project_destroy 销毁工程上下文: ptr=%p", static_cast<void*>(handle));
     delete handle;
 }
 
@@ -169,10 +375,9 @@ GeoStatus geo_project_load_dat(
         SetLastError("点云文件路径不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_load_dat(slot=%d, path=%s)", surface_slot, utf8_file_path);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
-
         const GeoDatLoadParams effective_params = (params != nullptr)
             ? *params
             : geo_default_dat_load_params();
@@ -186,7 +391,6 @@ GeoStatus geo_project_load_dat(
         parse_opts.min_valid_elevation = effective_params.min_valid_elevation;
         parse_opts.max_valid_elevation = effective_params.max_valid_elevation;
         parse_opts.filter_zero_coordinates = effective_params.filter_zero_coordinates;
-
         if (progress_cb != nullptr) {
             parse_opts.progress_callback = [progress_cb, user_data](double prog, uint64_t pts) -> bool {
                 return progress_cb(prog, pts, user_data);
@@ -201,14 +405,12 @@ GeoStatus geo_project_load_dat(
         geo_kernel::DatPointCloudParser parser;
         geo_kernel::DatParseStats stats;
         const std::filesystem::path fs_path = Utf8ToPath(utf8_file_path);
-
         geo_kernel::OperationResult res = parser.ParseFile(
             fs_path,
             parse_opts,
             target_surface.points,
             target_surface.code_dict,
             stats);
-
         if (!res.IsOk()) {
             SetLastError(res.message);
             return MapStatus(res.code);
@@ -216,10 +418,23 @@ GeoStatus geo_project_load_dat(
 
         if (!handle->shared_rtc.initialized) {
             handle->shared_rtc = stats.rtc_transform;
+            GEO_LOG_INFO(
+                "C_API",
+                "初始化工程共享 RTC 原点: (%.3f, %.3f, %.3f)",
+                handle->shared_rtc.origin.x,
+                handle->shared_rtc.origin.y,
+                handle->shared_rtc.origin.z);
         } else {
             const geo_kernel::Vec3d delta_origin =
                 stats.rtc_transform.origin - handle->shared_rtc.origin;
             if (delta_origin.LengthSquared() > 1e-12) {
+                GEO_LOG_DEBUG(
+                    "C_API",
+                    "槽位 %d 对齐至共享 RTC 原点，补偿偏移: (%.3f, %.3f, %.3f)",
+                    surface_slot,
+                    delta_origin.x,
+                    delta_origin.y,
+                    delta_origin.z);
                 for (auto& pt : target_surface.points) {
                     pt.x += delta_origin.x;
                     pt.y += delta_origin.y;
@@ -243,18 +458,15 @@ GeoStatus geo_project_load_dat(
             out_summary->filtered_outliers = stats.filtered_outliers;
             out_summary->elapsed_seconds = stats.elapsed_seconds;
             out_summary->throughput_mpts_per_sec = stats.throughput_mpts_per_sec;
-
             out_summary->rtc_origin[0] = handle->shared_rtc.origin.x;
             out_summary->rtc_origin[1] = handle->shared_rtc.origin.y;
             out_summary->rtc_origin[2] = handle->shared_rtc.origin.z;
-
             out_summary->global_min[0] = stats.global_bounds.min_pt.x;
             out_summary->global_min[1] = stats.global_bounds.min_pt.y;
             out_summary->global_min[2] = stats.global_bounds.min_pt.z;
             out_summary->global_max[0] = stats.global_bounds.max_pt.x;
             out_summary->global_max[1] = stats.global_bounds.max_pt.y;
             out_summary->global_max[2] = stats.global_bounds.max_pt.z;
-
             out_summary->local_min[0] = stats.local_bounds.min_pt.x;
             out_summary->local_min[1] = stats.local_bounds.min_pt.y;
             out_summary->local_min[2] = stats.local_bounds.min_pt.z;
@@ -262,12 +474,14 @@ GeoStatus geo_project_load_dat(
             out_summary->local_max[1] = stats.local_bounds.max_pt.y;
             out_summary->local_max[2] = stats.local_bounds.max_pt.z;
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (const std::bad_alloc&) {
         SetLastError("导入点云数据时内存不足");
         return GEO_STATUS_OUT_OF_MEMORY;
+    } catch (const std::exception& ex) {
+        SetLastError(std::string("导入点云数据时捕获标准异常: ") + ex.what());
+        return GEO_STATUS_INTERNAL_ERROR;
     } catch (...) {
         SetLastError("导入点云数据时发生未预期内部异常");
         return GEO_STATUS_INTERNAL_ERROR;
@@ -292,7 +506,7 @@ GeoStatus geo_project_build_octree(
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_build_octree(slot=%d)", surface_slot);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -300,26 +514,22 @@ GeoStatus geo_project_build_octree(
             SetLastError("目标槽位尚未导入点云数据，无法构建八叉树");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         const GeoOctreeParams effective = (params != nullptr) ? *params : geo_default_octree_params();
         geo_kernel::OctreeBuildOptions opts;
         opts.max_depth = effective.max_depth;
         opts.max_points_per_leaf = effective.max_points_per_leaf;
         opts.max_lod_points_per_node = effective.max_lod_points_per_node;
         opts.thread_count = effective.thread_count;
-
         geo_kernel::OctreeBuildStats stats;
         geo_kernel::OperationResult res = target_surface.octree.Build(
             target_surface.points,
             target_surface.local_bounds,
             opts,
             stats);
-
         if (!res.IsOk()) {
             SetLastError(res.message);
             return MapStatus(res.code);
         }
-
         if (out_summary != nullptr) {
             out_summary->total_points = stats.total_points;
             out_summary->total_nodes = stats.total_nodes;
@@ -327,9 +537,11 @@ GeoStatus geo_project_build_octree(
             out_summary->max_reached_depth = stats.max_reached_depth;
             out_summary->elapsed_seconds = stats.elapsed_seconds;
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
+    } catch (const std::exception& ex) {
+        SetLastError(std::string("构建点云八叉树时捕获标准异常: ") + ex.what());
+        return GEO_STATUS_INTERNAL_ERROR;
     } catch (...) {
         SetLastError("构建点云八叉树时发生未预期内部异常");
         return GEO_STATUS_INTERNAL_ERROR;
@@ -352,7 +564,6 @@ GeoStatus geo_project_query_visible_octree_nodes(
         SetLastError("查询参数 query 或输出计数指针 out_node_count 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         const SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -360,7 +571,6 @@ GeoStatus geo_project_query_visible_octree_nodes(
             SetLastError("目标槽位尚未构建点云八叉树");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         geo_kernel::CameraViewParams view;
         view.camera_local_pos = {
             query->camera_local_pos[0],
@@ -373,23 +583,19 @@ GeoStatus geo_project_query_visible_octree_nodes(
         view.sse_threshold_px = query->sse_threshold_px;
         view.max_point_budget = query->max_point_budget;
         view.enable_frustum_culling = query->enable_frustum_culling;
-
         std::vector<uint32_t> visible_ids;
         uint64_t est_pts = 0;
         target_surface.octree.QueryVisibleNodes(view, visible_ids, est_pts);
-
         *out_node_count = static_cast<uint32_t>(visible_ids.size());
         if (out_estimated_points != nullptr) {
             *out_estimated_points = est_pts;
         }
-
         if (out_node_ids != nullptr && capacity > 0 && !visible_ids.empty()) {
             const uint32_t copy_count = (static_cast<uint32_t>(visible_ids.size()) < capacity)
                 ? static_cast<uint32_t>(visible_ids.size())
                 : capacity;
             std::memcpy(out_node_ids, visible_ids.data(), static_cast<size_t>(copy_count) * sizeof(uint32_t));
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -413,7 +619,6 @@ GeoStatus geo_project_fetch_octree_node_gpu_packet(
         SetLastError("输出字节大小指针 out_byte_size 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         const SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -421,7 +626,6 @@ GeoStatus geo_project_fetch_octree_node_gpu_packet(
             SetLastError("目标槽位尚未构建点云八叉树");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         std::vector<uint8_t> packet;
         geo_kernel::OperationResult res = target_surface.octree.SerializeNodeToGpuPacket(
             node_id, target_surface.points, handle->shared_rtc, packet);
@@ -429,7 +633,6 @@ GeoStatus geo_project_fetch_octree_node_gpu_packet(
             SetLastError(res.message);
             return MapStatus(res.code);
         }
-
         *out_byte_size = packet.size();
         if (out_buffer != nullptr) {
             if (buffer_capacity < packet.size()) {
@@ -440,7 +643,6 @@ GeoStatus geo_project_fetch_octree_node_gpu_packet(
                 std::memcpy(out_buffer, packet.data(), packet.size());
             }
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -468,7 +670,7 @@ GeoStatus geo_project_build_tin(
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_build_tin(slot=%d)", surface_slot);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -476,19 +678,16 @@ GeoStatus geo_project_build_tin(
             SetLastError("目标槽位尚未导入点云数据，无法构建三角网");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         const GeoTinParams effective = (params != nullptr) ? *params : geo_default_tin_params();
         geo_kernel::TinBuildOptions opts;
         opts.decimation_grid_size = effective.decimation_grid_size;
         opts.tile_size = effective.tile_size;
         opts.max_edge_length = effective.max_edge_length;
-
         if (progress_cb != nullptr) {
             opts.progress_callback = [progress_cb, user_data](double prog, uint64_t verts) -> bool {
                 return progress_cb(prog, verts, user_data);
             };
         }
-
         target_surface.editor.ClearHistory();
         geo_kernel::TinBuildStats stats;
         geo_kernel::OperationResult res = target_surface.tin.BuildFromPoints(
@@ -497,7 +696,6 @@ GeoStatus geo_project_build_tin(
             SetLastError(res.message);
             return MapStatus(res.code);
         }
-
         if (out_summary != nullptr) {
             out_summary->input_points = stats.input_points;
             out_summary->deduplicated_points = stats.deduplicated_points;
@@ -507,9 +705,11 @@ GeoStatus geo_project_build_tin(
             out_summary->total_tiles = stats.total_tiles;
             out_summary->elapsed_seconds = stats.elapsed_seconds;
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
+    } catch (const std::exception& ex) {
+        SetLastError(std::string("构建三角网时捕获标准异常: ") + ex.what());
+        return GEO_STATUS_INTERNAL_ERROR;
     } catch (...) {
         SetLastError("构建三角网时发生未预期内部异常");
         return GEO_STATUS_INTERNAL_ERROR;
@@ -531,7 +731,6 @@ GeoStatus geo_project_query_elevation(
         SetLastError("输出高程指针 out_local_z 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         const SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -539,18 +738,15 @@ GeoStatus geo_project_query_elevation(
             SetLastError("目标槽位尚未构建有效三角网");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         double lz = 0.0;
         if (!target_surface.tin.QueryElevationAt(local_x, local_y, lz, nullptr)) {
             SetLastError("查询点坐标超出三角网平面覆盖范围");
             return GEO_STATUS_TILE_NOT_FOUND;
         }
-
         *out_local_z = lz;
         if (out_global_z != nullptr) {
             *out_global_z = lz + handle->shared_rtc.origin.z;
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -573,12 +769,10 @@ GeoStatus geo_project_get_dirty_tin_tiles(
         SetLastError("输出瓦片计数指针 out_tile_count 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         const SurfaceDataset& target_surface = handle->surfaces[surface_slot];
         const std::vector<uint32_t> dirty_tiles = target_surface.tin.GetDirtyTileIndices();
-
         *out_tile_count = static_cast<uint32_t>(dirty_tiles.size());
         if (out_tile_indices != nullptr && capacity > 0 && !dirty_tiles.empty()) {
             const uint32_t copy_count = (static_cast<uint32_t>(dirty_tiles.size()) < capacity)
@@ -589,7 +783,6 @@ GeoStatus geo_project_get_dirty_tin_tiles(
                 dirty_tiles.data(),
                 static_cast<size_t>(copy_count) * sizeof(uint32_t));
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -614,7 +807,6 @@ GeoStatus geo_project_fetch_tin_tile_gpu_packet(
         SetLastError("输出字节大小指针 out_byte_size 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -622,7 +814,6 @@ GeoStatus geo_project_fetch_tin_tile_gpu_packet(
             SetLastError("目标槽位尚未构建有效三角网");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         std::vector<uint8_t> packet;
         geo_kernel::OperationResult res = target_surface.tin.SerializeTileToGpuPacket(
             tile_index, handle->shared_rtc, packet);
@@ -630,7 +821,6 @@ GeoStatus geo_project_fetch_tin_tile_gpu_packet(
             SetLastError(res.message);
             return MapStatus(res.code);
         }
-
         *out_byte_size = packet.size();
         if (out_buffer != nullptr) {
             if (buffer_capacity < packet.size()) {
@@ -644,7 +834,6 @@ GeoStatus geo_project_fetch_tin_tile_gpu_packet(
                 target_surface.tin.ClearTileDirty(tile_index);
             }
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -667,7 +856,6 @@ GeoStatus geo_project_pick_tin_ray(
         SetLastError("射线拾取参数指针不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         const SurfaceDataset& target_surface = handle->surfaces[surface_slot];
@@ -675,11 +863,9 @@ GeoStatus geo_project_pick_tin_ray(
             SetLastError("目标槽位尚未构建有效三角网");
             return GEO_STATUS_EMPTY_DATASET;
         }
-
         const geo_kernel::RayHitResult hit = target_surface.tin.PickByRay(
             {ray_origin[0], ray_origin[1], ray_origin[2]},
             {ray_dir[0], ray_dir[1], ray_dir[2]});
-
         std::memset(out_hit, 0, sizeof(GeoRayHitResult));
         out_hit->hit = hit.hit;
         out_hit->triangle_id = hit.triangle_id;
@@ -689,7 +875,6 @@ GeoStatus geo_project_pick_tin_ray(
         out_hit->hit_local_pos[0] = hit.hit_point.x;
         out_hit->hit_local_pos[1] = hit.hit_point.y;
         out_hit->hit_local_pos[2] = hit.hit_point.z;
-
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -708,7 +893,8 @@ GeoStatus geo_project_tin_flip_edge(
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_flip_edge(slot=%d, tri=%u, edge=%d, force=%d)",
+                 surface_slot, triangle_id, edge_slot, force_flip ? 1 : 0);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::OperationResult res =
@@ -734,7 +920,8 @@ GeoStatus geo_project_tin_modify_vertex_z(
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_modify_vertex_z(slot=%d, vid=%u, new_z=%.4f)",
+                 surface_slot, vertex_id, new_local_z);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::OperationResult res =
@@ -766,7 +953,8 @@ GeoStatus geo_project_tin_insert_vertex(
         SetLastError("待插入顶点坐标数组 local_xyz 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_insert_vertex(slot=%d, xyz=(%.3f, %.3f, %.3f), code=%u)",
+                 surface_slot, local_xyz[0], local_xyz[1], local_xyz[2], code_id);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::OperationResult res = handle->surfaces[surface_slot].editor.InsertVertex(
@@ -803,7 +991,8 @@ GeoStatus geo_project_tin_insert_breakline(
         SetLastError("特征折线顶点数组不能为空且至少包含 2 个点");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_insert_breakline(slot=%d, pts=%u, code=%u, interpZ=%d)",
+                 surface_slot, point_count, code_id, interpolate_z_from_tin ? 1 : 0);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         std::vector<geo_kernel::Vec3d> poly = UnpackXyzArray(xyz_array, point_count);
@@ -829,7 +1018,7 @@ GeoStatus geo_project_tin_delete_vertex(
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_delete_vertex(slot=%d, vid=%u)", surface_slot, vertex_id);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::OperationResult res =
@@ -860,7 +1049,8 @@ GeoStatus geo_project_tin_clip_polygon(
         SetLastError("裁剪多边形至少需要 3 个顶点");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_clip_polygon(slot=%d, pts=%u, keep_inside=%d)",
+                 surface_slot, point_count, keep_inside ? 1 : 0);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         std::vector<geo_kernel::Vec3d> poly = UnpackXyzArray(xyz_array, point_count);
@@ -883,7 +1073,7 @@ GeoStatus geo_project_tin_undo(GeoProjectHandle handle, int32_t surface_slot) {
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_undo(slot=%d)", surface_slot);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::OperationResult res = handle->surfaces[surface_slot].editor.Undo();
@@ -904,7 +1094,7 @@ GeoStatus geo_project_tin_redo(GeoProjectHandle handle, int32_t surface_slot) {
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_tin_redo(slot=%d)", surface_slot);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::OperationResult res = handle->surfaces[surface_slot].editor.Redo();
@@ -929,7 +1119,6 @@ GeoStatus geo_project_tin_get_history_state(
     if (!ValidateProjectAndSlot(handle, surface_slot, err)) {
         return err;
     }
-
     std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
     if (out_can_undo != nullptr) {
         *out_can_undo = handle->surfaces[surface_slot].editor.CanUndo();
@@ -958,7 +1147,8 @@ GeoStatus geo_project_compute_earthwork_exact(
         SetLastError("输出土方报告指针 out_summary 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_compute_earthwork_exact(p1=%d, p2=%d, roi_pts=%u)",
+                 period1_slot, period2_slot, roi_point_count);
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::EarthworkOptions opts;
@@ -966,7 +1156,6 @@ GeoStatus geo_project_compute_earthwork_exact(
         if (roi_xyz_array != nullptr && roi_point_count >= 3) {
             opts.roi_polygon = UnpackXyzArray(roi_xyz_array, roi_point_count);
         }
-
         geo_kernel::EarthworkCalculator calc;
         geo_kernel::EarthworkReport report;
         geo_kernel::OperationResult res = calc.ComputeExactTinToTinVolume(
@@ -974,12 +1163,10 @@ GeoStatus geo_project_compute_earthwork_exact(
             handle->surfaces[period2_slot].tin,
             opts,
             report);
-
         if (!res.IsOk()) {
             SetLastError(res.message);
             return MapStatus(res.code);
         }
-
         FillEarthworkSummary(report, *out_summary);
         ClearLastError();
         return GEO_STATUS_OK;
@@ -1007,7 +1194,8 @@ GeoStatus geo_project_compute_earthwork_grid(
         SetLastError("输出土方报告指针 out_summary 不能为空");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_compute_earthwork_grid(p1=%d, p2=%d, step=%.3f)",
+                 period1_slot, period2_slot, grid_step);
     try {
         std::shared_lock<std::shared_mutex> lock(handle->rw_mutex);
         geo_kernel::EarthworkOptions opts;
@@ -1016,7 +1204,6 @@ GeoStatus geo_project_compute_earthwork_grid(
         if (roi_xyz_array != nullptr && roi_point_count >= 3) {
             opts.roi_polygon = UnpackXyzArray(roi_xyz_array, roi_point_count);
         }
-
         geo_kernel::EarthworkCalculator calc;
         geo_kernel::EarthworkReport report;
         geo_kernel::OperationResult res = calc.ComputeFastGridDifferential(
@@ -1025,12 +1212,10 @@ GeoStatus geo_project_compute_earthwork_grid(
             opts,
             report,
             nullptr);
-
         if (!res.IsOk()) {
             SetLastError(res.message);
             return MapStatus(res.code);
         }
-
         FillEarthworkSummary(report, *out_summary);
         ClearLastError();
         return GEO_STATUS_OK;
@@ -1077,10 +1262,10 @@ GeoStatus geo_project_compute_slope_grading(
         SetLastError("多级放坡参数 stages 不能为空且至少包含 1 级");
         return GEO_STATUS_INVALID_ARGUMENT;
     }
-
+    GEO_LOG_INFO("C_API", "geo_project_compute_slope_grading(orig=%d, base_pts=%u, stages=%u, merged=%d)",
+                 original_terrain_slot, base_point_count, stage_count, generate_merged_terrain ? 1 : 0);
     try {
         std::unique_lock<std::shared_mutex> lock(handle->rw_mutex);
-
         const GeoGradingParams effective = (params != nullptr)
             ? *params
             : geo_default_grading_params();
@@ -1096,7 +1281,6 @@ GeoStatus geo_project_compute_slope_grading(
         } else {
             opts.vertical_mode = geo_kernel::GradingVerticalMode::kAutoCutFill;
         }
-
         opts.base_polygon = UnpackXyzArray(base_xyz_array, base_point_count);
         opts.use_uniform_base_elevation = effective.use_uniform_base_elevation;
         opts.base_elevation = effective.base_elevation;
@@ -1104,7 +1288,6 @@ GeoStatus geo_project_compute_slope_grading(
         opts.cap_inward_bottom = effective.cap_inward_bottom;
         opts.perimeter_sample_step = effective.perimeter_sample_step;
         opts.output_tile_size = effective.output_tile_size;
-
         opts.stages.reserve(stage_count);
         for (uint32_t i = 0; i < stage_count; ++i) {
             geo_kernel::SlopeStageSpec st{};
@@ -1128,7 +1311,6 @@ GeoStatus geo_project_compute_slope_grading(
             grading_only_ds.tin,
             generate_merged_terrain ? &merged_ds.tin : nullptr,
             result);
-
         if (!res.IsOk()) {
             SetLastError(res.message);
             return MapStatus(res.code);
@@ -1158,9 +1340,11 @@ GeoStatus geo_project_compute_slope_grading(
             out_summary->daylight_converged = result.daylight_converged;
             out_summary->elapsed_seconds = result.elapsed_seconds;
         }
-
         ClearLastError();
         return GEO_STATUS_OK;
+    } catch (const std::exception& ex) {
+        SetLastError(std::string("执行多级放坡建模与土方计算时捕获标准异常: ") + ex.what());
+        return GEO_STATUS_INTERNAL_ERROR;
     } catch (...) {
         SetLastError("执行多级放坡建模与土方计算时发生内部异常");
         return GEO_STATUS_INTERNAL_ERROR;
@@ -1168,4 +1352,3 @@ GeoStatus geo_project_compute_slope_grading(
 }
 
 }  // extern "C"
-

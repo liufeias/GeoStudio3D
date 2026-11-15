@@ -2,11 +2,10 @@
 //!
 //! 设计规范：
 //!   1. 所有 `#[repr(C)]` 结构体与 `include/geo_kernel/geo_kernel_c_api.h` 严格逐字节对齐；
-//!   2. 严格路径加载策略：仅从当前桌面主程序（`geo-studio-3d.exe`）所在同级目录加载
-//!      `GeoKernelCore.dll`（Linux 为 `libGeoKernelCore.so`，macOS 为 `libGeoKernelCore.dylib`），
-//!      禁止跨目录猜测或回退搜索系统环境变量路径，杜绝加载错误版本动态库的风险；
+//!   2. 严格路径加载策略：仅从当前桌面主程序所在同级目录加载核心动态库，禁止跨目录猜测；
 //!   3. 若同级目录下不存在核心动态库或加载失败，返回包含精确期望路径与系统错误码的中文诊断信息；
-//!   4. 暴露线程安全的 `SafeGeoProject` 句柄包装，析构时自动调用 `geo_project_destroy` 释放全部 C++ 内存。
+//!   4. Debug 调试版（`#[cfg(debug_assertions)]`）下详细输出动态库路径、符号绑定、FFI 调用与错误详情；
+//!      Release 版完全剔除所有日志语句，实现零性能损耗。
 
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -14,6 +13,9 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::sync::Arc;
+
+#[cfg(debug_assertions)]
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -320,24 +322,30 @@ impl GeoKernelLib {
 
         // 唯一合法加载路径：与主程序严格位于同一目录下的动态链接库
         let exact_dll_path = exe_dir.join(lib_name);
+        crate::app_log_info!("FFI", "正在检测核心几何内核动态库: {}", exact_dll_path.display());
 
         if !exact_dll_path.is_file() {
-            return Err(format!(
+            let err_msg = format!(
                 "同级目录下缺少核心几何内核动态库 {}。\n期望精确路径: {}\n请确保 {} 与主程序放在同一文件夹内。",
                 lib_name,
                 exact_dll_path.display(),
                 lib_name
-            ));
+            );
+            crate::app_log_error!("FFI", "{}", err_msg);
+            return Err(err_msg);
         }
 
         let lib = unsafe { Library::new(&exact_dll_path) }.map_err(|err| {
-            format!(
+            let msg = format!(
                 "加载同级目录核心动态库失败。\n目标路径: {}\n系统错误详情: {}",
                 exact_dll_path.display(),
                 err
-            )
+            );
+            crate::app_log_error!("FFI", "{}", msg);
+            msg
         })?;
 
+        crate::app_log_info!("FFI", "核心动态库装载成功，开始绑定全部 25 个 C ABI 符号...");
         unsafe { Self::bind_symbols(lib) }
     }
 
@@ -346,12 +354,16 @@ impl GeoKernelLib {
             ($name:ident, $ty:ty) => {{
                 let sym: Symbol<$ty> = lib
                     .get(concat!(stringify!($name), "\0").as_bytes())
-                    .map_err(|e| format!("绑定内核符号 {} 失败: {}", stringify!($name), e))?;
+                    .map_err(|e| {
+                        let err = format!("绑定内核符号 {} 失败: {}", stringify!($name), e);
+                        crate::app_log_error!("FFI", "{}", err);
+                        err
+                    })?;
                 *sym
             }};
         }
 
-        Ok(Self {
+        let bound = Self {
             geo_get_last_error: load_sym!(geo_get_last_error, unsafe extern "C" fn() -> *const c_char),
             geo_project_create: load_sym!(geo_project_create, unsafe extern "C" fn() -> GeoProjectHandle),
             geo_project_destroy: load_sym!(geo_project_destroy, unsafe extern "C" fn(GeoProjectHandle)),
@@ -439,7 +451,9 @@ impl GeoKernelLib {
                 unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u32, *const GeoSlopeStageSpec, u32, *const GeoGradingParams, bool, *mut f64, u32, *mut GeoGradingSummary) -> GeoStatus
             ),
             _lib: lib,
-        })
+        };
+        crate::app_log_info!("FFI", "C++20 核心动态库全部 ABI 符号绑定完成");
+        Ok(bound)
     }
 
     pub fn last_error_string(&self) -> String {
@@ -456,7 +470,10 @@ impl GeoKernelLib {
         if st == GeoStatus::Ok {
             Ok(())
         } else {
-            Err(format!("{} (状态码: {:?})", self.last_error_string(), st))
+            let err_str = self.last_error_string();
+            let full = format!("{} (状态码: {:?})", err_str, st);
+            crate::app_log_error!("FFI", "C++ 内核返回非成功状态: {}", full);
+            Err(full)
         }
     }
 }
@@ -474,8 +491,11 @@ impl SafeGeoProject {
     pub fn new(lib: Arc<GeoKernelLib>) -> Result<Self, String> {
         let handle = unsafe { (lib.geo_project_create)() };
         if handle.is_null() {
-            return Err(lib.last_error_string());
+            let err = lib.last_error_string();
+            crate::app_log_error!("FFI", "创建 GeoProject 句柄失败: {}", err);
+            return Err(err);
         }
+        crate::app_log_info!("FFI", "GeoProject 工程会话句柄创建成功: {:p}", handle);
         Ok(Self { lib, handle })
     }
 
@@ -485,11 +505,24 @@ impl SafeGeoProject {
         file_path: &str,
         coord_order: i32,
     ) -> Result<GeoDatSummary, String> {
-        let c_path = CString::new(file_path).map_err(|_| "文件路径包含非法空字符".to_string())?;
+        #[cfg(debug_assertions)]
+        let t0 = Instant::now();
+        crate::app_log_info!(
+            "FFI",
+            "开始调用 geo_project_load_dat: slot={}, order={}, path={}",
+            slot,
+            coord_order,
+            file_path
+        );
+
+        let c_path = CString::new(file_path).map_err(|_| {
+            let msg = "文件路径包含非法空字符".to_string();
+            crate::app_log_error!("FFI", "{}", msg);
+            msg
+        })?;
         let mut params = unsafe { (self.lib.geo_default_dat_load_params)() };
         params.coord_order = coord_order;
         let mut summary = GeoDatSummary::default();
-
         let st = unsafe {
             (self.lib.geo_project_load_dat)(
                 self.handle,
@@ -502,10 +535,21 @@ impl SafeGeoProject {
             )
         };
         self.lib.check_status(st)?;
+
+        #[cfg(debug_assertions)]
+        crate::app_log_info!(
+            "FFI",
+            "geo_project_load_dat 完成 (Rust侧耗时 {:.2} ms): valid_points={}, throughput={:.2} Mpts/s",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            summary.valid_points,
+            summary.throughput_mpts_per_sec
+        );
         Ok(summary)
     }
 
     pub fn fetch_octree_packet(&self, slot: i32, node_id: u32) -> Result<Vec<u8>, String> {
+        #[cfg(debug_assertions)]
+        let t0 = Instant::now();
         let mut byte_size: usize = 0;
         let st1 = unsafe {
             (self.lib.geo_project_fetch_octree_node_gpu_packet)(
@@ -518,7 +562,6 @@ impl SafeGeoProject {
             )
         };
         self.lib.check_status(st1)?;
-
         let mut buf = vec![0u8; byte_size];
         if byte_size > 0 {
             let st2 = unsafe {
@@ -533,6 +576,15 @@ impl SafeGeoProject {
             };
             self.lib.check_status(st2)?;
         }
+        #[cfg(debug_assertions)]
+        crate::app_log_debug!(
+            "FFI",
+            "fetch_octree_packet(slot={}, node={}) -> {} bytes ({:.2} ms)",
+            slot,
+            node_id,
+            byte_size,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(buf)
     }
 
@@ -542,6 +594,8 @@ impl SafeGeoProject {
         tile_index: u32,
         clear_dirty: bool,
     ) -> Result<Vec<u8>, String> {
+        #[cfg(debug_assertions)]
+        let t0 = Instant::now();
         let mut byte_size: usize = 0;
         let st1 = unsafe {
             (self.lib.geo_project_fetch_tin_tile_gpu_packet)(
@@ -555,7 +609,6 @@ impl SafeGeoProject {
             )
         };
         self.lib.check_status(st1)?;
-
         let mut buf = vec![0u8; byte_size];
         if byte_size > 0 {
             let st2 = unsafe {
@@ -571,6 +624,16 @@ impl SafeGeoProject {
             };
             self.lib.check_status(st2)?;
         }
+        #[cfg(debug_assertions)]
+        crate::app_log_debug!(
+            "FFI",
+            "fetch_tin_tile_packet(slot={}, tile={}, clear={}) -> {} bytes ({:.2} ms)",
+            slot,
+            tile_index,
+            clear_dirty,
+            byte_size,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
         Ok(buf)
     }
 }
@@ -578,6 +641,7 @@ impl SafeGeoProject {
 impl Drop for SafeGeoProject {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            crate::app_log_info!("FFI", "正在销毁 GeoProject 句柄 {:p}", self.handle);
             unsafe {
                 (self.lib.geo_project_destroy)(self.handle);
             }
@@ -585,4 +649,3 @@ impl Drop for SafeGeoProject {
         }
     }
 }
-

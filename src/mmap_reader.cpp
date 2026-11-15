@@ -1,8 +1,6 @@
 #include "geo_kernel/mmap_reader.hpp"
-
 #include <cstring>
 #include <utility>
-
 #if defined(_WIN32)
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
@@ -17,9 +15,7 @@
 #endif
 
 namespace geo_kernel {
-
 namespace {
-
 /**
  * @brief C++20 兼容的路径转 UTF-8 std::string 辅助函数（解决 MSVC /std:c++20 下 u8string 返回 char8_t 的类型差异）
  */
@@ -42,10 +38,12 @@ std::string FormatWindowsError(DWORD err_code) {
         nullptr);
     std::string result;
     if (size > 0 && buffer != nullptr) {
-        const int utf8_len = WideCharToMultiByte(CP_UTF8, 0, buffer, static_cast<int>(size), nullptr, 0, nullptr, nullptr);
+        const int utf8_len = WideCharToMultiByte(
+            CP_UTF8, 0, buffer, static_cast<int>(size), nullptr, 0, nullptr, nullptr);
         if (utf8_len > 0) {
             result.resize(static_cast<size_t>(utf8_len));
-            WideCharToMultiByte(CP_UTF8, 0, buffer, static_cast<int>(size), result.data(), utf8_len, nullptr, nullptr);
+            WideCharToMultiByte(
+                CP_UTF8, 0, buffer, static_cast<int>(size), result.data(), utf8_len, nullptr, nullptr);
         }
         LocalFree(buffer);
     }
@@ -55,7 +53,6 @@ std::string FormatWindowsError(DWORD err_code) {
     return result + " (错误码: " + std::to_string(err_code) + ")";
 }
 #endif
-
 }  // namespace
 
 MappedFileReader::~MappedFileReader() noexcept {
@@ -94,19 +91,20 @@ MappedFileReader& MappedFileReader::operator=(MappedFileReader&& other) noexcept
 
 OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) noexcept {
     Close();
-
     try {
         if (file_path.empty()) {
             return OperationResult::Fail(StatusCode::kInvalidArgument, "文件路径不能为空");
         }
-
+#if GEO_DEBUG_ENABLED
+        const std::string utf8_path = PathToUtf8String(file_path);
+        GEO_LOG_INFO("MMAP", "准备映射点云文件: %s", utf8_path.c_str());
+#endif
         std::error_code ec;
         if (!std::filesystem::exists(file_path, ec) || ec) {
             return OperationResult::Fail(
                 StatusCode::kFileNotFound,
                 "找不到指定点云文件: " + PathToUtf8String(file_path));
         }
-
         if (std::filesystem::is_directory(file_path, ec)) {
             return OperationResult::Fail(
                 StatusCode::kInvalidArgument,
@@ -122,14 +120,12 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
             nullptr);
-
         if (hFile == INVALID_HANDLE_VALUE) {
             const DWORD err = GetLastError();
             return OperationResult::Fail(
                 StatusCode::kFileOpenFailed,
                 "打开点云文件失败: " + FormatWindowsError(err));
         }
-
         LARGE_INTEGER file_size_li{};
         if (!GetFileSizeEx(hFile, &file_size_li)) {
             const DWORD err = GetLastError();
@@ -138,14 +134,11 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
                 StatusCode::kFileOpenFailed,
                 "获取文件大小失败: " + FormatWindowsError(err));
         }
-
         if (file_size_li.QuadPart <= 0) {
             CloseHandle(hFile);
             return OperationResult::Fail(StatusCode::kEmptyDataset, "点云文件内容为空 (0 字节)");
         }
-
         raw_size_ = static_cast<uint64_t>(file_size_li.QuadPart);
-
         HANDLE hMapping = CreateFileMappingW(
             hFile,
             nullptr,
@@ -153,7 +146,6 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
             0,
             0,
             nullptr);
-
         if (hMapping == nullptr) {
             const DWORD err = GetLastError();
             CloseHandle(hFile);
@@ -162,7 +154,6 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
                 StatusCode::kFileOpenFailed,
                 "创建内存映射对象失败: " + FormatWindowsError(err));
         }
-
         void* view = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
         if (view == nullptr) {
             const DWORD err = GetLastError();
@@ -173,7 +164,6 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
                 StatusCode::kFileOpenFailed,
                 "映射文件视图到虚拟内存失败: " + FormatWindowsError(err));
         }
-
         file_handle_ = hFile;
         mapping_handle_ = hMapping;
         mapped_base_ = static_cast<const char*>(view);
@@ -184,7 +174,6 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
                 StatusCode::kFileOpenFailed,
                 std::string("打开点云文件失败: ") + std::strerror(errno));
         }
-
         struct stat st {};
         if (::fstat(fd, &st) != 0) {
             const int err = errno;
@@ -193,12 +182,10 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
                 StatusCode::kFileOpenFailed,
                 std::string("获取文件元数据失败: ") + std::strerror(err));
         }
-
         if (st.st_size <= 0) {
             ::close(fd);
             return OperationResult::Fail(StatusCode::kEmptyDataset, "点云文件内容为空 (0 字节)");
         }
-
         raw_size_ = static_cast<uint64_t>(st.st_size);
         void* view = ::mmap(nullptr, static_cast<size_t>(raw_size_), PROT_READ, MAP_PRIVATE, fd, 0);
         if (view == MAP_FAILED) {
@@ -209,22 +196,20 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
                 StatusCode::kFileOpenFailed,
                 std::string("mmap 映射文件失败: ") + std::strerror(err));
         }
-
         ::posix_madvise(view, static_cast<size_t>(raw_size_), POSIX_MADV_SEQUENTIAL);
-
         fd_ = fd;
         mapped_base_ = static_cast<const char*>(view);
 #endif
 
         effective_data_ = mapped_base_;
         effective_size_ = raw_size_;
-
         if (raw_size_ >= 3 &&
             static_cast<uint8_t>(mapped_base_[0]) == 0xEF &&
             static_cast<uint8_t>(mapped_base_[1]) == 0xBB &&
             static_cast<uint8_t>(mapped_base_[2]) == 0xBF) {
             effective_data_ += 3;
             effective_size_ -= 3;
+            GEO_LOG_DEBUG("MMAP", "检测到 UTF-8 BOM 文件头，已自动跳过前 3 字节");
         } else if (raw_size_ >= 2) {
             const auto b0 = static_cast<uint8_t>(mapped_base_[0]);
             const auto b1 = static_cast<uint8_t>(mapped_base_[1]);
@@ -236,7 +221,17 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
             }
         }
 
+        GEO_LOG_INFO(
+            "MMAP",
+            "文件内存映射成功: raw_size=%llu bytes, effective_size=%llu bytes",
+            static_cast<unsigned long long>(raw_size_),
+            static_cast<unsigned long long>(effective_size_));
         return OperationResult::Ok();
+    } catch (const std::exception& ex) {
+        Close();
+        return OperationResult::Fail(
+            StatusCode::kInternalError,
+            std::string("文件映射过程中捕获异常: ") + ex.what());
     } catch (...) {
         Close();
         return OperationResult::Fail(StatusCode::kInternalError, "文件映射过程中发生未预期内部异常");
@@ -244,6 +239,12 @@ OperationResult MappedFileReader::Open(const std::filesystem::path& file_path) n
 }
 
 void MappedFileReader::Close() noexcept {
+    if (mapped_base_ != nullptr) {
+        GEO_LOG_DEBUG(
+            "MMAP",
+            "释放内存映射视图 (raw_size=%llu bytes)",
+            static_cast<unsigned long long>(raw_size_));
+    }
 #if defined(_WIN32)
     if (mapped_base_ != nullptr) {
         UnmapViewOfFile(mapped_base_);
@@ -273,4 +274,3 @@ void MappedFileReader::Close() noexcept {
 }
 
 }  // namespace geo_kernel
-

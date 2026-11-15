@@ -1,5 +1,4 @@
 #include "geo_kernel/dat_parser.hpp"
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -9,20 +8,16 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
 #include "geo_kernel/mmap_reader.hpp"
 
 namespace geo_kernel {
-
 namespace {
-
 // 预计算 10 的正负幂次查找表，加速 FastParseDouble 小数与科学计数法解析
 constexpr double kPow10Pos[] = {
     1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,
     1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
     1e20, 1e21, 1e22
 };
-
 constexpr double kPow10Neg[] = {
     1e0,   1e-1,  1e-2,  1e-3,  1e-4,  1e-5,  1e-6,  1e-7,  1e-8,  1e-9,
     1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18, 1e-19,
@@ -53,11 +48,9 @@ inline const char* TrimRight(const char* begin, const char* p) noexcept {
 struct TokenSlice {
     const char* begin = nullptr;
     const char* end = nullptr;
-
     [[nodiscard]] size_t Length() const noexcept {
         return static_cast<size_t>(end - begin);
     }
-
     [[nodiscard]] std::string_view View() const noexcept {
         return {begin, Length()};
     }
@@ -73,7 +66,6 @@ int SplitLineTokens(const char* line_begin, const char* line_end, TokenSlice out
     if (p >= end) {
         return 0;
     }
-
     bool has_explicit_delim = false;
     for (const char* scan = p; scan < end; ++scan) {
         if (*scan == ',' || *scan == '\t' || *scan == ';') {
@@ -81,7 +73,6 @@ int SplitLineTokens(const char* line_begin, const char* line_end, TokenSlice out
             break;
         }
     }
-
     int count = 0;
     if (has_explicit_delim) {
         const char* field_start = p;
@@ -106,7 +97,6 @@ int SplitLineTokens(const char* line_begin, const char* line_end, TokenSlice out
             out_tokens[count++] = {word_start, p};
         }
     }
-
     return count;
 }
 
@@ -134,7 +124,6 @@ uint32_t ParsePointId(std::string_view sv, uint32_t fallback_seq) noexcept {
     if (all_digits) {
         return static_cast<uint32_t>(val);
     }
-
     uint32_t hash = 2166136261u;
     for (unsigned char c : sv) {
         hash ^= c;
@@ -157,20 +146,17 @@ struct ThreadWorkerResult {
     std::vector<std::string> local_code_list;
     std::vector<std::string> error_samples;
 };
-
 }  // namespace
 
 // ==============================================================================
 // 高性能无锁双精度解析器实现
 // ==============================================================================
-
 bool FastParseDouble(const char* begin, const char* end, double& out_value) noexcept {
     const char* p = TrimLeft(begin, end);
     const char* stop = TrimRight(p, end);
     if (p >= stop) {
         return false;
     }
-
     bool negative = false;
     if (*p == '-') {
         negative = true;
@@ -181,12 +167,10 @@ bool FastParseDouble(const char* begin, const char* end, double& out_value) noex
     if (p >= stop) {
         return false;
     }
-
     uint64_t mantissa = 0;
     int exponent_adjust = 0;
     int significant_digits = 0;
     bool has_any_digit = false;
-
     while (p < stop && *p >= '0' && *p <= '9') {
         has_any_digit = true;
         if (significant_digits < 19) {
@@ -199,7 +183,6 @@ bool FastParseDouble(const char* begin, const char* end, double& out_value) noex
         }
         ++p;
     }
-
     if (p < stop && *p == '.') {
         ++p;
         while (p < stop && *p >= '0' && *p <= '9') {
@@ -214,11 +197,9 @@ bool FastParseDouble(const char* begin, const char* end, double& out_value) noex
             ++p;
         }
     }
-
     if (!has_any_digit) {
         return false;
     }
-
     int explicit_exp = 0;
     if (p < stop && (*p == 'e' || *p == 'E')) {
         ++p;
@@ -243,14 +224,11 @@ bool FastParseDouble(const char* begin, const char* end, double& out_value) noex
             explicit_exp = -explicit_exp;
         }
     }
-
     if (p != stop) {
         return false;
     }
-
     double val = static_cast<double>(mantissa);
     const int total_exp = exponent_adjust + explicit_exp;
-
     if (total_exp > 0) {
         if (total_exp <= 22) {
             val *= kPow10Pos[total_exp];
@@ -265,11 +243,9 @@ bool FastParseDouble(const char* begin, const char* end, double& out_value) noex
             val *= std::pow(10.0, static_cast<double>(total_exp));
         }
     }
-
     if (!std::isfinite(val)) {
         return false;
     }
-
     out_value = negative ? -val : val;
     return true;
 }
@@ -277,7 +253,6 @@ bool FastParseDouble(const char* begin, const char* end, double& out_value) noex
 // ==============================================================================
 // 多线程 .dat 点云主解析流程
 // ==============================================================================
-
 OperationResult DatPointCloudParser::ParseFile(
     const std::filesystem::path& file_path,
     const DatParseOptions& options,
@@ -285,7 +260,6 @@ OperationResult DatPointCloudParser::ParseFile(
     std::vector<std::string>& out_code_dict,
     DatParseStats& out_stats) const {
     const auto start_tp = std::chrono::steady_clock::now();
-
     out_points.clear();
     out_code_dict.clear();
     out_code_dict.emplace_back("");
@@ -296,11 +270,9 @@ OperationResult DatPointCloudParser::ParseFile(
     if (!open_res.IsOk()) {
         return open_res;
     }
-
     const char* const data = reader.Data();
     const uint64_t total_size = reader.Size();
     out_stats.file_bytes = reader.RawFileSize();
-
     if (total_size == 0) {
         return OperationResult::Fail(StatusCode::kEmptyDataset, "文件有效文本内容为空");
     }
@@ -320,21 +292,18 @@ OperationResult DatPointCloudParser::ParseFile(
     };
     std::vector<ByteRange> chunks;
     chunks.reserve(num_threads);
-
     uint64_t current_start = 0;
     const uint64_t avg_chunk = total_size / num_threads;
     for (size_t i = 0; i < num_threads && current_start < total_size; ++i) {
         uint64_t target_end = (i == num_threads - 1)
             ? total_size
             : std::min<uint64_t>(total_size, current_start + avg_chunk);
-
         while (target_end < total_size && data[target_end] != '\n') {
             ++target_end;
         }
         if (target_end < total_size && data[target_end] == '\n') {
             ++target_end;
         }
-
         if (target_end > current_start) {
             chunks.push_back({current_start, target_end});
             current_start = target_end;
@@ -342,6 +311,15 @@ OperationResult DatPointCloudParser::ParseFile(
     }
 
     const size_t actual_threads = chunks.size();
+    GEO_LOG_INFO(
+        "DAT",
+        "启动多线程点云解析: total_bytes=%llu, threads=%zu, elev_filter=%d [%.1f, %.1f]",
+        static_cast<unsigned long long>(total_size),
+        actual_threads,
+        options.enable_elevation_filter ? 1 : 0,
+        options.min_valid_elevation,
+        options.max_valid_elevation);
+
     std::vector<ThreadWorkerResult> worker_results(actual_threads);
     std::atomic<uint64_t> processed_bytes{0};
     std::atomic<uint64_t> atomic_valid_points{0};
@@ -350,14 +328,11 @@ OperationResult DatPointCloudParser::ParseFile(
     auto worker_fn = [&](size_t worker_idx) {
         const ByteRange range = chunks[worker_idx];
         ThreadWorkerResult& res = worker_results[worker_idx];
-
         const uint64_t chunk_bytes = range.end - range.start;
         res.raw_global_points.reserve(static_cast<size_t>(chunk_bytes / 36 + 64));
-
         const char* p = data + range.start;
         const char* const chunk_end = data + range.end;
         TokenSlice tokens[6];
-
         uint64_t batch_bytes = 0;
         uint64_t batch_pts = 0;
         uint32_t local_seq = static_cast<uint32_t>(worker_idx * 10000000u + 1u);
@@ -366,13 +341,11 @@ OperationResult DatPointCloudParser::ParseFile(
             if ((res.lines_scanned & 0x3FFFull) == 0 && cancel_requested.load(std::memory_order_relaxed)) {
                 return;
             }
-
             const void* nl_ptr = std::memchr(p, '\n', static_cast<size_t>(chunk_end - p));
             const char* line_end = (nl_ptr != nullptr)
                 ? static_cast<const char*>(nl_ptr)
                 : chunk_end;
             const char* next_line = (nl_ptr != nullptr) ? (line_end + 1) : chunk_end;
-
             batch_bytes += static_cast<uint64_t>(next_line - p);
             ++res.lines_scanned;
 
@@ -446,8 +419,6 @@ OperationResult DatPointCloudParser::ParseFile(
             //   - 测绘 Y 轴（东向 Easting）  -> 内部笛卡尔 X 轴
             //   - 测绘 X 轴（北向 Northing） -> 内部笛卡尔 Y 轴
             //   - 测绘 H 轴（高程 Elevation）-> 内部笛卡尔 Z 轴
-            // 因此在 kSurveyingYXZ（列序 Y, X, H）和 kCartesianXYZ（列序 X, Y, Z）两种规范下，
-            // 第一坐标分量 c1 均对应东向 X，第二坐标分量 c2 均对应北向 Y。
             (void)options.coord_order;
             const double gx = c1;
             const double gy = c2;
@@ -488,21 +459,17 @@ OperationResult DatPointCloudParser::ParseFile(
             if (code_id != 0) {
                 pt.flags |= SurveyPoint::kFlagFeature;
             }
-
             res.raw_global_points.push_back(pt);
             res.bounds.Expand({gx, gy, gz});
             ++batch_pts;
-
             if ((batch_pts & 0xFFFFull) == 0) {
                 processed_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
                 atomic_valid_points.fetch_add(batch_pts, std::memory_order_relaxed);
                 batch_bytes = 0;
                 batch_pts = 0;
             }
-
             p = next_line;
         }
-
         processed_bytes.fetch_add(batch_bytes, std::memory_order_relaxed);
         atomic_valid_points.fetch_add(batch_pts, std::memory_order_relaxed);
     };
@@ -519,7 +486,6 @@ OperationResult DatPointCloudParser::ParseFile(
             const uint64_t pts = atomic_valid_points.load(std::memory_order_relaxed);
             const double ratio = std::clamp(
                 static_cast<double>(done) / static_cast<double>(total_size), 0.0, 0.92);
-
             if (!options.progress_callback(ratio, pts)) {
                 cancel_requested.store(true, std::memory_order_relaxed);
                 break;
@@ -538,13 +504,13 @@ OperationResult DatPointCloudParser::ParseFile(
     }
 
     if (cancel_requested.load(std::memory_order_relaxed)) {
+        GEO_LOG_WARN("DAT", "点云解析任务已被用户回调中止");
         return OperationResult::Fail(StatusCode::kCancelled, "用户已取消点云导入解析任务");
     }
 
     uint64_t total_valid = 0;
     std::unordered_map<std::string, uint16_t> global_code_map;
     std::vector<std::vector<uint16_t>> code_remap(actual_threads);
-
     for (size_t i = 0; i < actual_threads; ++i) {
         const auto& r = worker_results[i];
         total_valid += static_cast<uint64_t>(r.raw_global_points.size());
@@ -553,13 +519,11 @@ OperationResult DatPointCloudParser::ParseFile(
         out_stats.malformed_lines += r.malformed_lines;
         out_stats.filtered_outliers += r.filtered_outliers;
         out_stats.global_bounds.Expand(r.bounds);
-
         for (const auto& err_msg : r.error_samples) {
             if (out_stats.error_samples.size() < options.max_error_samples) {
                 out_stats.error_samples.push_back(err_msg);
             }
         }
-
         code_remap[i].resize(r.local_code_list.size() + 1, 0);
         for (size_t c_idx = 0; c_idx < r.local_code_list.size(); ++c_idx) {
             const std::string& code_str = r.local_code_list[c_idx];
@@ -575,6 +539,19 @@ OperationResult DatPointCloudParser::ParseFile(
         }
     }
 
+#if GEO_DEBUG_ENABLED
+    if (out_stats.malformed_lines > 0) {
+        GEO_LOG_WARN(
+            "DAT",
+            "解析发现 %llu 行异常格式数据，以下为前 %zu 条错误采样:",
+            static_cast<unsigned long long>(out_stats.malformed_lines),
+            out_stats.error_samples.size());
+        for (size_t s_idx = 0; s_idx < out_stats.error_samples.size(); ++s_idx) {
+            GEO_LOG_WARN("DAT", "  样本 #%zu: %s", s_idx + 1, out_stats.error_samples[s_idx].c_str());
+        }
+    }
+#endif
+
     if (total_valid == 0) {
         return OperationResult::Fail(
             StatusCode::kParseFormatError,
@@ -584,7 +561,6 @@ OperationResult DatPointCloudParser::ParseFile(
     out_stats.valid_points = total_valid;
     out_stats.rtc_transform.InitializeFromBounds(out_stats.global_bounds);
     const Vec3d rtc_origin = out_stats.rtc_transform.origin;
-
     out_stats.local_bounds.min_pt = out_stats.global_bounds.min_pt - rtc_origin;
     out_stats.local_bounds.max_pt = out_stats.global_bounds.max_pt - rtc_origin;
 
@@ -610,7 +586,6 @@ OperationResult DatPointCloudParser::ParseFile(
             const auto& src = worker_results[i].raw_global_points;
             const auto& remap = code_remap[i];
             SurveyPoint* dst = out_points.data() + write_offsets[i];
-
             for (size_t k = 0; k < src.size(); ++k) {
                 SurveyPoint pt = src[k];
                 pt.x -= rtc_origin.x;
@@ -623,7 +598,6 @@ OperationResult DatPointCloudParser::ParseFile(
             }
         });
     }
-
     for (auto& t : copy_threads) {
         if (t.joinable()) {
             t.join();
@@ -641,8 +615,21 @@ OperationResult DatPointCloudParser::ParseFile(
             (static_cast<double>(total_valid) / 1e6) / out_stats.elapsed_seconds;
     }
 
+    GEO_LOG_INFO(
+        "DAT",
+        "解析统计汇总: scanned=%llu, valid=%llu, skipped=%llu, malformed=%llu, outliers=%llu, codes=%zu, rtc=(%.1f, %.1f, %.1f), time=%.3fs (%.2f Mpts/s)",
+        static_cast<unsigned long long>(out_stats.total_lines_scanned),
+        static_cast<unsigned long long>(out_stats.valid_points),
+        static_cast<unsigned long long>(out_stats.skipped_empty_or_comment),
+        static_cast<unsigned long long>(out_stats.malformed_lines),
+        static_cast<unsigned long long>(out_stats.filtered_outliers),
+        out_code_dict.size() - 1,
+        rtc_origin.x,
+        rtc_origin.y,
+        rtc_origin.z,
+        out_stats.elapsed_seconds,
+        out_stats.throughput_mpts_per_sec);
     return OperationResult::Ok();
 }
 
 }  // namespace geo_kernel
-
