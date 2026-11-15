@@ -1,5 +1,4 @@
 #include "geo_kernel/point_octree.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -10,9 +9,7 @@
 #include <unordered_set>
 
 namespace geo_kernel {
-
 namespace {
-
 /**
  * @brief 莫顿码与原始点索引绑定项（16 字节对齐，利于 SIMD/缓存预取）
  */
@@ -30,24 +27,20 @@ static_assert(sizeof(MortonKeyIndex) == 16, "MortonKeyIndex 必须为 16 字节"
 void ParallelRadixSortMorton(std::vector<MortonKeyIndex>& keys, size_t thread_count) {
     const size_t n = keys.size();
     if (n <= 1) return;
-
     if (n < 65536 || thread_count <= 1) {
         std::sort(keys.begin(), keys.end(), [](const MortonKeyIndex& a, const MortonKeyIndex& b) noexcept {
             return a.morton < b.morton;
         });
         return;
     }
-
     std::vector<MortonKeyIndex> buffer(n);
     MortonKeyIndex* src = keys.data();
     MortonKeyIndex* dst = buffer.data();
-
     // 按线程均匀分块
     std::vector<size_t> chunk_offsets(thread_count + 1, 0);
     for (size_t t = 0; t <= thread_count; ++t) {
         chunk_offsets[t] = (n * t) / thread_count;
     }
-
     // 每个线程维护 256 个桶的局部直方图
     std::vector<std::array<size_t, 256>> local_hist(thread_count);
     std::vector<std::array<size_t, 256>> thread_write_offsets(thread_count);
@@ -55,7 +48,6 @@ void ParallelRadixSortMorton(std::vector<MortonKeyIndex>& keys, size_t thread_co
     // 莫顿码有效位为低 63 位，执行 8 趟每次 8 位（共 64 位）完整排序
     for (int pass = 0; pass < 8; ++pass) {
         const uint32_t shift = static_cast<uint32_t>(pass * 8);
-
         // 步骤 1：多线程并行统计各分块字节直方图
         {
             std::vector<std::thread> workers;
@@ -74,7 +66,6 @@ void ParallelRadixSortMorton(std::vector<MortonKeyIndex>& keys, size_t thread_co
             }
             for (auto& w : workers) w.join();
         }
-
         // 步骤 2：计算全局桶前缀和及各线程的精确写入起始偏移（保持稳定性）
         size_t global_offset = 0;
         for (size_t b = 0; b < 256; ++b) {
@@ -83,7 +74,6 @@ void ParallelRadixSortMorton(std::vector<MortonKeyIndex>& keys, size_t thread_co
                 global_offset += local_hist[t][b];
             }
         }
-
         // 步骤 3：多线程无锁并发分散写入目标缓冲区
         {
             std::vector<std::thread> workers;
@@ -101,7 +91,6 @@ void ParallelRadixSortMorton(std::vector<MortonKeyIndex>& keys, size_t thread_co
             }
             for (auto& w : workers) w.join();
         }
-
         std::swap(src, dst);
     }
     // 8 趟为偶数趟，最终排序结果恰好落回 keys.data() 中
@@ -115,10 +104,8 @@ BoundingBox3d ComputeChildCubicBox(const BoundingBox3d& parent_box, int octant) 
     BoundingBox3d child;
     child.min_pt.x = (octant & 1) ? c.x : parent_box.min_pt.x;
     child.max_pt.x = (octant & 1) ? parent_box.max_pt.x : c.x;
-
     child.min_pt.y = (octant & 2) ? c.y : parent_box.min_pt.y;
     child.max_pt.y = (octant & 2) ? parent_box.max_pt.y : c.y;
-
     child.min_pt.z = (octant & 4) ? c.z : parent_box.min_pt.z;
     child.max_pt.z = (octant & 4) ? parent_box.max_pt.z : c.z;
     return child;
@@ -134,7 +121,6 @@ inline int GetPointOctant(const Vec3d& center, const SurveyPoint& p) noexcept {
     if (p.z >= center.z) octant |= 4;
     return octant;
 }
-
 }  // namespace
 
 struct PointCloudOctree::BuildContext {
@@ -145,6 +131,9 @@ struct PointCloudOctree::BuildContext {
 };
 
 void PointCloudOctree::Clear() noexcept {
+    if (!nodes_.empty()) {
+        GEO_LOG_DEBUG("OCTREE", "清空八叉树释放 %zu 个节点缓存", nodes_.size());
+    }
     nodes_.clear();
     nodes_.shrink_to_fit();
     root_cubic_bounds_ = BoundingBox3d{};
@@ -163,7 +152,6 @@ OperationResult PointCloudOctree::Build(
     if (points.empty() || !local_bounds.IsValid()) {
         return OperationResult::Fail(StatusCode::kEmptyDataset, "点云数据为空，无法构建八叉树");
     }
-
     const size_t n = points.size();
     if (n > static_cast<size_t>(UINT32_MAX)) {
         return OperationResult::Fail(
@@ -180,12 +168,20 @@ OperationResult PointCloudOctree::Build(
         num_threads = 1;
     }
 
+    GEO_LOG_INFO(
+        "OCTREE",
+        "开始构建线性八叉树: points=%zu, threads=%zu, max_depth=%u, leaf_cap=%u, lod_cap=%u",
+        n,
+        num_threads,
+        options.max_depth,
+        options.max_points_per_leaf,
+        options.max_lod_points_per_node);
+
     // 1. 构建严格正立方体根节点包围盒（外扩 1e-3 米防止边界点浮点越界）
     const Vec3d center = local_bounds.Center();
     const Vec3d extent = local_bounds.Extent();
     const double max_dim = std::max({extent.x, extent.y, extent.z, 1.0});
     const double half_size = 0.5 * max_dim + 1e-3;
-
     root_cubic_bounds_.min_pt = {center.x - half_size, center.y - half_size, center.z - half_size};
     root_cubic_bounds_.max_pt = {center.x + half_size, center.y + half_size, center.z + half_size};
     const double inv_span = 1.0 / (2.0 * half_size);
@@ -215,7 +211,6 @@ OperationResult PointCloudOctree::Build(
 
         // 3. 并行基数排序莫顿码，随后按空间连续顺序重排原始点云数组
         ParallelRadixSortMorton(morton_keys, num_threads);
-
         {
             std::vector<SurveyPoint> reordered_points(n);
             std::vector<std::thread> workers;
@@ -241,7 +236,6 @@ OperationResult PointCloudOctree::Build(
         const size_t estimated_nodes = std::max<size_t>(
             64, (n / std::max<uint32_t>(1, options.max_points_per_leaf)) * 2);
         nodes_.reserve(estimated_nodes);
-
         BuildContext ctx{points, options, 0, 0};
         BuildRecursive(ctx, UINT32_MAX, 0, root_cubic_bounds_, 0, static_cast<uint64_t>(n));
 
@@ -252,10 +246,23 @@ OperationResult PointCloudOctree::Build(
         out_stats.max_reached_depth = ctx.max_depth_reached;
         out_stats.elapsed_seconds = std::chrono::duration<double>(end_tp - start_tp).count();
 
+        GEO_LOG_INFO(
+            "OCTREE",
+            "八叉树构建完成: total_nodes=%u, leaf_nodes=%u, max_depth=%u, cubic_half=%.2fm, elapsed=%.3fs",
+            out_stats.total_nodes,
+            out_stats.leaf_nodes,
+            out_stats.max_reached_depth,
+            half_size,
+            out_stats.elapsed_seconds);
         return OperationResult::Ok();
     } catch (const std::bad_alloc&) {
         Clear();
         return OperationResult::Fail(StatusCode::kOutOfMemory, "构建点云八叉树时内存不足");
+    } catch (const std::exception& ex) {
+        Clear();
+        return OperationResult::Fail(
+            StatusCode::kInternalError,
+            std::string("构建点云八叉树时捕获异常: ") + ex.what());
     } catch (...) {
         Clear();
         return OperationResult::Fail(StatusCode::kInternalError, "构建点云八叉树时发生未预期内部异常");
@@ -271,7 +278,6 @@ uint32_t PointCloudOctree::BuildRecursive(
     uint64_t end_idx) {
     const uint32_t node_id = static_cast<uint32_t>(nodes_.size());
     nodes_.emplace_back();
-
     OctreeNode& init_node = nodes_[node_id];
     init_node.node_id = node_id;
     init_node.parent_id = parent_id;
@@ -279,18 +285,15 @@ uint32_t PointCloudOctree::BuildRecursive(
     init_node.cubic_bounds = cubic_box;
     init_node.point_start = start_idx;
     init_node.point_count = end_idx - start_idx;
-
     if (depth > ctx.max_depth_reached) {
         ctx.max_depth_reached = depth;
     }
 
     const uint64_t count = end_idx - start_idx;
-
     // 终止条件：点数小于等于叶子阈值，或已达到最大树深度
     if (count <= ctx.opts.max_points_per_leaf || depth >= ctx.opts.max_depth) {
         init_node.is_leaf = true;
         ++ctx.leaf_count;
-
         BoundingBox3d tight;
         for (uint64_t i = start_idx; i < end_idx; ++i) {
             tight.Expand(ctx.points[static_cast<size_t>(i)].Position());
@@ -299,7 +302,7 @@ uint32_t PointCloudOctree::BuildRecursive(
         return node_id;
     }
 
-    // 内部节点：按子象限 [0..7] 划分（由于已按莫顿码全局排序，各象限点集在数组中天然形成连续子区间）
+    // 内部节点：按子象限 [0..7] 划分
     nodes_[node_id].is_leaf = false;
     const Vec3d center = cubic_box.Center();
 
@@ -335,7 +338,6 @@ uint32_t PointCloudOctree::BuildRecursive(
         octant_cursors[oct] = running;
         running += octant_counts[oct];
     }
-
     for (int oct = 0; oct < 8; ++oct) {
         const uint64_t bucket_end = octant_offsets[oct] + octant_counts[oct];
         while (octant_cursors[oct] < bucket_end) {
@@ -356,7 +358,6 @@ uint32_t PointCloudOctree::BuildRecursive(
         UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX
     };
     BoundingBox3d combined_tight;
-
     for (int oct = 0; oct < 8; ++oct) {
         const uint64_t c_start = octant_offsets[oct];
         const uint64_t c_end = c_start + octant_counts[oct];
@@ -392,10 +393,9 @@ void PointCloudOctree::GenerateInternalNodeLod(BuildContext& ctx, OctreeNode& no
             ? static_cast<size_t>(child.point_count)
             : child.lod_point_indices.size();
     }
-
     if (estimated_candidates == 0) return;
-    candidates.reserve(estimated_candidates);
 
+    candidates.reserve(estimated_candidates);
     for (int oct = 0; oct < 8; ++oct) {
         const uint32_t cid = node.children[oct];
         if (cid == UINT32_MAX) continue;
@@ -422,8 +422,7 @@ void PointCloudOctree::GenerateInternalNodeLod(BuildContext& ctx, OctreeNode& no
     node.lod_point_indices.reserve(cap);
     std::vector<uint32_t> non_feature_candidates;
     non_feature_candidates.reserve(candidates.size());
-
-    const size_t max_feature_quota = (cap * 3) / 4;  // 最多为特征点保留 75% 配额
+    const size_t max_feature_quota = (cap * 3) / 4; // 最多为特征点保留 75% 配额
     for (uint32_t idx : candidates) {
         if (ctx.points[idx].IsFeature() && node.lod_point_indices.size() < max_feature_quota) {
             node.lod_point_indices.push_back(idx);
@@ -432,7 +431,7 @@ void PointCloudOctree::GenerateInternalNodeLod(BuildContext& ctx, OctreeNode& no
         }
     }
 
-    // 剩余配额按空间等步长抽稀（由于 candidates 本身按八叉树象限/莫顿码排列，等步长采样具有极佳的空间均匀性）
+    // 剩余配额按空间等步长抽稀
     const size_t remaining_quota = cap - node.lod_point_indices.size();
     if (remaining_quota > 0 && !non_feature_candidates.empty()) {
         if (non_feature_candidates.size() <= remaining_quota) {
@@ -455,20 +454,17 @@ bool PointCloudOctree::IsBoxOutsideFrustum(
     const BoundingBox3d& box,
     const double frustum_planes[6][4]) const noexcept {
     if (!box.IsValid()) return true;
-
     for (int p = 0; p < 6; ++p) {
         const double a = frustum_planes[p][0];
         const double b = frustum_planes[p][1];
         const double c = frustum_planes[p][2];
         const double d = frustum_planes[p][3];
-
         // 选取沿平面法线方向最正的包围盒顶点（P-Vertex）进行快速外侧判定
         const double px = (a >= 0.0) ? box.max_pt.x : box.min_pt.x;
         const double py = (b >= 0.0) ? box.max_pt.y : box.min_pt.y;
         const double pz = (c >= 0.0) ? box.max_pt.z : box.min_pt.z;
-
         if (a * px + b * py + c * pz + d < 0.0) {
-            return true;  // 整个包围盒完全处于该裁剪平面外侧
+            return true; // 整个包围盒完全处于该裁剪平面外侧
         }
     }
     return false;
@@ -491,7 +487,6 @@ void PointCloudOctree::QueryVisibleNodes(
         uint32_t node_id = 0;
         double distance = 0.0;
         double sse_pixels = 0.0;
-
         // 优先队列按屏幕误差降序、相机距离升序排列，确保离相机近且重要的节点优先获得点数预算
         bool operator<(const QueueEntry& rhs) const noexcept {
             if (std::abs(sse_pixels - rhs.sse_pixels) > 1e-3) {
@@ -507,7 +502,6 @@ void PointCloudOctree::QueryVisibleNodes(
         const double radius = std::max(0.5 * node.tight_bounds.Diagonal(), 0.05);
         const double dist_to_center = (c - view.camera_local_pos).Length();
         const double effective_dist = std::max(dist_to_center - radius, 0.1);
-        // 节点内部点间距粗略估计为 radius / 32，计算其在屏幕上的投影像素误差
         const double geometric_error = radius / 32.0;
         const double sse = (geometric_error * proj_scale) / effective_dist;
         return {nid, effective_dist, sse};
@@ -521,7 +515,6 @@ void PointCloudOctree::QueryVisibleNodes(
     while (!pq.empty()) {
         const QueueEntry cur = pq.top();
         pq.pop();
-
         const OctreeNode& node = nodes_[cur.node_id];
         const uint64_t node_render_pts = node.is_leaf
             ? node.point_count
@@ -573,7 +566,6 @@ OperationResult PointCloudOctree::SerializeNodeToGpuPacket(
     const RtcTransform& rtc,
     std::vector<uint8_t>& out_packet) const {
     out_packet.clear();
-
     if (node_id >= nodes_.size()) {
         return OperationResult::Fail(
             StatusCode::kTileNotFound,
@@ -590,10 +582,10 @@ OperationResult PointCloudOctree::SerializeNodeToGpuPacket(
     out_packet.resize(header_bytes + payload_bytes);
 
     GpuTilePacketHeader header{};
-    header.magic = 0x544F4547u;  // "GEOT"
+    header.magic = 0x544F4547u; // "GEOT"
     header.version = 1u;
     header.payload_type = static_cast<uint32_t>(GpuTilePayloadType::kPointCloudOctreeNode);
-    header.flags = 0u;  // 纯点云节点无索引缓冲
+    header.flags = 0u;
     header.tile_x = static_cast<int32_t>(node.depth);
     header.tile_y = static_cast<int32_t>(node.node_id);
     header.tile_uid = (static_cast<uint64_t>(node.depth) << 32) | static_cast<uint64_t>(node.node_id);
@@ -601,18 +593,15 @@ OperationResult PointCloudOctree::SerializeNodeToGpuPacket(
     header.vertex_count = vertex_count;
     header.index_count = 0u;
     header.vertex_stride = static_cast<uint32_t>(sizeof(GpuPointVertex));
-
     header.rtc_origin[0] = rtc.origin.x;
     header.rtc_origin[1] = rtc.origin.y;
     header.rtc_origin[2] = rtc.origin.z;
-
     header.bbox_min[0] = static_cast<float>(node.tight_bounds.min_pt.x);
     header.bbox_min[1] = static_cast<float>(node.tight_bounds.min_pt.y);
     header.bbox_min[2] = static_cast<float>(node.tight_bounds.min_pt.z);
     header.bbox_max[0] = static_cast<float>(node.tight_bounds.max_pt.x);
     header.bbox_max[1] = static_cast<float>(node.tight_bounds.max_pt.y);
     header.bbox_max[2] = static_cast<float>(node.tight_bounds.max_pt.z);
-
     std::memcpy(out_packet.data(), &header, header_bytes);
 
     if (vertex_count > 0) {
@@ -650,9 +639,7 @@ OperationResult PointCloudOctree::SerializeNodeToGpuPacket(
             }
         }
     }
-
     return OperationResult::Ok();
 }
 
 }  // namespace geo_kernel
-

@@ -38,7 +38,14 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # ------------------------------------------------------------------------------
-# 平台与编译器精细化调优
+# Windows 平台全局预处理器防护（同时覆盖 MSVC cl.exe 与 Windows Clang/LLVM）
+# ------------------------------------------------------------------------------
+if(WIN32)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# ------------------------------------------------------------------------------
+# 编译器精细化调优（严格保持 IEEE 754 浮点语义，保障精确几何谓词可靠性）
 # ------------------------------------------------------------------------------
 if(MSVC)
     # 启用 UTF-8 源码与执行字符集，消除中文注释与路径编码警告
@@ -59,7 +66,6 @@ if(MSVC)
             $<$<CONFIG:RelWithDebInfo>:/O2>
         )
     endif()
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
     # 严禁开启 -ffast-math，否则会破坏 Shewchuk 浮点误差扩展算法

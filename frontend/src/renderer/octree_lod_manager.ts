@@ -13,10 +13,11 @@
  *   3. 零拷贝 InterleavedBuffer 绑定：
  *      - 直接将 16 字节步长的 `ArrayBuffer` 包装为 `THREE.InterleavedBuffer`，分别绑定 `position`
  *        (offset 0, itemSize 3) 与 `aPackedAttr` (offset 3, itemSize 1)，显存零冗余拷贝。
+ *   4. Debug 模式详细日志追踪：
+ *      - 记录节点调度、并发拉取、GPU 缓冲上传及 LRU 淘汰详情；Release 模式零开销跳过。
  */
-
 import * as THREE from 'three';
-import { IGeoKernelBridge } from '../bridge/kernel_bridge';
+import { IGeoKernelBridge, frontendLogger } from '../bridge/kernel_bridge';
 import {
   CameraQueryInput,
   DecodedPointCloudPacket,
@@ -37,11 +38,9 @@ export class OctreeLodManager {
   private readonly slot: SurfaceSlot;
   private readonly group: THREE.Group;
   private readonly material: THREE.ShaderMaterial;
-
   private readonly cache = new Map<number, CachedOctreeNodeGpu>();
   private readonly pendingLoads = new Set<number>();
   private activeNodeIds = new Set<number>();
-
   private frameCounter = 0;
   private maxCacheNodes = 512;
   private maxConcurrentFetches = 8;
@@ -50,7 +49,6 @@ export class OctreeLodManager {
   private isEnabled = true;
   private isBuilt = false;
   private isQueryInFlight = false;
-
   private lastCameraSignature = '';
   private currentVisiblePoints = 0;
 
@@ -66,21 +64,25 @@ export class OctreeLodManager {
     this.group = new THREE.Group();
     this.group.name = `PointCloudOctree_Slot_${slot}`;
     parentScene.add(this.group);
+    frontendLogger.debug('OCTREE', () => `初始化点云八叉树渲染管理器 (槽位 ${slot})`);
   }
 
   setBuilt(built: boolean): void {
     this.isBuilt = built;
     this.lastCameraSignature = '';
+    frontendLogger.info('OCTREE', () => `槽位 ${this.slot} 八叉树状态更新为: ${built ? '已就绪' : '未构建'}`);
   }
 
   setVisible(visible: boolean): void {
     this.isEnabled = visible;
     this.group.visible = visible;
+    frontendLogger.debug('OCTREE', () => `槽位 ${this.slot} 点云可见性切换为: ${visible}`);
   }
 
   setPointBudget(budget: number): void {
     this.pointBudget = Math.max(500_000, budget);
     this.lastCameraSignature = '';
+    frontendLogger.debug('OCTREE', () => `槽位 ${this.slot} 单帧点云预算调整为: ${this.pointBudget}`);
   }
 
   getVisiblePointCount(): number {
@@ -95,6 +97,7 @@ export class OctreeLodManager {
    * 清空全部显存几何体缓存（重新导入点云时调用）
    */
   clearAll(): void {
+    const prevCount = this.cache.size;
     for (const entry of this.cache.values()) {
       this.group.remove(entry.pointsObj);
       entry.geometry.dispose();
@@ -105,6 +108,7 @@ export class OctreeLodManager {
     this.currentVisiblePoints = 0;
     this.lastCameraSignature = '';
     this.isBuilt = false;
+    frontendLogger.debug('OCTREE', () => `已清理槽位 ${this.slot} 显存缓存节点 (${prevCount} 个)`);
   }
 
   /**
@@ -115,13 +119,11 @@ export class OctreeLodManager {
     if (!this.isEnabled || !this.isBuilt) {
       return;
     }
-
     const sig = this.computeCameraSignature(camera, viewportHeightPx);
     if (sig !== this.lastCameraSignature && !this.isQueryInFlight) {
       this.lastCameraSignature = sig;
       void this.scheduleLodQuery(camera, viewportHeightPx);
     }
-
     this.evictStaleCacheEntries();
   }
 
@@ -148,7 +150,6 @@ export class OctreeLodManager {
       camera.matrixWorldInverse
     );
     const frustum = new THREE.Frustum().setFromProjectionMatrix(projView);
-
     // Three.js Frustum 平面顺序为: 0=Right, 1=Left, 2=Bottom, 3=Top, 4=Far, 5=Near
     // 调整为与 C++ 端严格一致的 [Left, Right, Bottom, Top, Near, Far] 顺序
     const orderedPlanes = [
@@ -159,7 +160,6 @@ export class OctreeLodManager {
       frustum.planes[5],
       frustum.planes[4],
     ];
-
     return orderedPlanes.map((pl) => [
       pl.normal.x,
       pl.normal.y,
@@ -183,7 +183,6 @@ export class OctreeLodManager {
         maxPointBudget: this.pointBudget,
         enableFrustumCulling: true,
       };
-
       const res = await this.bridge.queryVisibleOctreeNodes(this.slot, query);
       if (!this.isBuilt) return;
 
@@ -193,7 +192,6 @@ export class OctreeLodManager {
       // 1. 立即激活已在显存缓存中的目标节点，并统计已就绪点数
       let readyPoints = 0;
       const missingIds: number[] = [];
-
       for (const nid of res.nodeIds) {
         const cached = this.cache.get(nid);
         if (cached) {
@@ -213,19 +211,22 @@ export class OctreeLodManager {
           }
         }
       }
-
       this.currentVisiblePoints = readyPoints;
+
+      frontendLogger.debug(
+        'OCTREE',
+        () => `视锥LOD查询: 命中节点 ${res.nodeIds.length} 个, 缓存命中点数 ${readyPoints}, 待拉取节点 ${missingIds.length} 个, 预估总点数 ${res.estimatedPoints}`
+      );
 
       // 3. 并发限流拉取缺失的八叉树节点 GPU 二进制数据包
       const availableSlots = Math.max(0, this.maxConcurrentFetches - this.pendingLoads.size);
       const batchToFetch = missingIds.slice(0, availableSlots);
-
       for (const nid of batchToFetch) {
         this.pendingLoads.add(nid);
         void this.fetchAndUploadNode(nid);
       }
     } catch (err) {
-      console.warn('[OctreeLodManager] LOD 调度查询异常:', err);
+      frontendLogger.error('OCTREE', () => `八叉树可视节点 LOD 调度查询失败 (槽位 ${this.slot})`, err);
     } finally {
       this.isQueryInFlight = false;
     }
@@ -254,7 +255,6 @@ export class OctreeLodManager {
           'aPackedAttr',
           new THREE.InterleavedBufferAttribute(interleaved, 1, 3, false)
         );
-
         geometry.boundingBox = new THREE.Box3(
           new THREE.Vector3(...pkt.header.bboxMin),
           new THREE.Vector3(...pkt.header.bboxMax)
@@ -285,7 +285,7 @@ export class OctreeLodManager {
         this.lastCameraSignature = '';
       }
     } catch (err) {
-      console.warn(`[OctreeLodManager] 加载八叉树节点 #${nodeId} 失败:`, err);
+      frontendLogger.error('OCTREE', () => `加载并上传八叉树节点 #${nodeId} GPU 数据包失败`, err);
     } finally {
       this.pendingLoads.delete(nodeId);
     }
@@ -295,7 +295,6 @@ export class OctreeLodManager {
     if (this.cache.size <= this.maxCacheNodes) {
       return;
     }
-
     // 收集所有非当前激活的缓存节点并按最近使用帧号升序淘汰
     const inactive: CachedOctreeNodeGpu[] = [];
     for (const entry of this.cache.values()) {
@@ -303,17 +302,23 @@ export class OctreeLodManager {
         inactive.push(entry);
       }
     }
-
     inactive.sort((a, b) => a.lastUsedFrame - b.lastUsedFrame);
 
     let toRemove = this.cache.size - this.maxCacheNodes;
+    let removedCount = 0;
     for (const item of inactive) {
       if (toRemove <= 0) break;
       this.group.remove(item.pointsObj);
       item.geometry.dispose();
       this.cache.delete(item.nodeId);
       --toRemove;
+      ++removedCount;
+    }
+    if (removedCount > 0) {
+      frontendLogger.debug(
+        'OCTREE',
+        () => `LRU 显存淘汰完成: 释放 ${removedCount} 个非活跃节点, 当前缓存节点数 ${this.cache.size}`
+      );
     }
   }
 }
-

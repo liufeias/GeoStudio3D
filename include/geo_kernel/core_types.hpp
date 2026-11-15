@@ -2,7 +2,7 @@
 
 /**
  * @file core_types.hpp
- * @brief 空间几何内核基础数据类型、RTC大坐标归化器、莫顿码空间索引与GPU二进制传输包定义
+ * @brief 空间几何内核基础数据类型、RTC大坐标归化器、莫顿码空间索引、GPU二进制传输包与日志宏定义
  *
  * 设计说明：
  *   1. 测绘领域工程坐标（如 CGCS2000 3度带投影坐标）通常带有 7~8 位整数部分。
@@ -11,15 +11,25 @@
  *      彻底消除大坐标下显卡渲染抖动与三角网破面问题。
  *   2. 所有跨模块/跨语言二进制数据包均采用 1 字节紧凑对齐 (#pragma pack(push, 1))，
  *      确保与 WebGPU / Three.js TypedArray 零开销直接映射。
+ *   3. 内核日志宏 (GEO_LOG_DEBUG / GEO_LOG_INFO / GEO_LOG_WARN / GEO_LOG_ERROR) 统一路由至
+ *      C ABI 日志回调，避免各模块直接操作 UCRT FILE* 引发 Windows Debug 断言崩溃。
  */
+
+// 防止 Windows 平台 <windows.h> 定义的 min/max 宏干扰 std::numeric_limits::max()
+#if defined(_WIN32) && !defined(NOMINMAX)
+    #define NOMINMAX
+#endif
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 // 跨平台动态库符号导出宏定义
@@ -40,6 +50,89 @@
 #endif
 
 namespace geo_kernel {
+
+// ==============================================================================
+// 0. 跨模块统一结构化日志分发器（支持单字符串与 printf 变参两种调用形式）
+// ==============================================================================
+
+namespace detail {
+
+/**
+ * @brief 将格式化后的日志消息写入 C ABI 回调或原生 UTF-8 控制台输出
+ * @param level 日志级别（0=DEBUG, 1=INFO, 2=WARN, 3=ERROR）
+ * @param file_path 源文件路径 (__FILE__)
+ * @param line_no 源码行号 (__LINE__)
+ * @param func_name 函数名 (__func__)
+ * @param message UTF-8 日志正文
+ */
+GEO_API void WriteKernelLog(
+    int32_t level,
+    const char* file_path,
+    int line_no,
+    const char* func_name,
+    std::string_view message) noexcept;
+
+inline void DispatchKernelLog(
+    int32_t level,
+    const char* file_path,
+    int line_no,
+    const char* func_name,
+    std::string_view message) noexcept {
+    WriteKernelLog(level, file_path, line_no, func_name, message);
+}
+
+template <typename... Args>
+inline void DispatchKernelLog(
+    int32_t level,
+    const char* file_path,
+    int line_no,
+    const char* func_name,
+    const char* fmt,
+    Args&&... args) noexcept {
+    if (fmt == nullptr) {
+        return;
+    }
+    if constexpr (sizeof...(Args) == 0) {
+        WriteKernelLog(level, file_path, line_no, func_name, fmt);
+    } else {
+        char stack_buf[1024];
+        const int needed = std::snprintf(
+            stack_buf, sizeof(stack_buf), fmt, std::forward<Args>(args)...);
+        if (needed >= 0 && static_cast<size_t>(needed) < sizeof(stack_buf)) {
+            WriteKernelLog(
+                level,
+                file_path,
+                line_no,
+                func_name,
+                std::string_view(stack_buf, static_cast<size_t>(needed)));
+        } else if (needed > 0) {
+            try {
+                std::string heap_buf(static_cast<size_t>(needed) + 1, '\0');
+                std::snprintf(
+                    heap_buf.data(), heap_buf.size(), fmt, std::forward<Args>(args)...);
+                WriteKernelLog(
+                    level,
+                    file_path,
+                    line_no,
+                    func_name,
+                    std::string_view(heap_buf.data(), static_cast<size_t>(needed)));
+            } catch (...) {
+                // 内存不足时忽略长日志分配失败，确保绝不抛出异常
+            }
+        }
+    }
+}
+
+}  // namespace detail
+
+#define GEO_LOG_DEBUG(...) \
+    ::geo_kernel::detail::DispatchKernelLog(0, __FILE__, __LINE__, __func__, __VA_ARGS__)
+#define GEO_LOG_INFO(...) \
+    ::geo_kernel::detail::DispatchKernelLog(1, __FILE__, __LINE__, __func__, __VA_ARGS__)
+#define GEO_LOG_WARN(...) \
+    ::geo_kernel::detail::DispatchKernelLog(2, __FILE__, __LINE__, __func__, __VA_ARGS__)
+#define GEO_LOG_ERROR(...) \
+    ::geo_kernel::detail::DispatchKernelLog(3, __FILE__, __LINE__, __func__, __VA_ARGS__)
 
 // ==============================================================================
 // 1. 统一状态码与错误诊断结构
@@ -178,12 +271,13 @@ struct Vec3d {
 
 /**
  * @brief 双精度三维轴对齐包围盒 (AABB)
+ *        使用括号包裹 (std::numeric_limits<double>::max)() 彻底免疫 Windows max/min 宏干扰
  */
 struct BoundingBox3d {
     Vec3d min_pt{
-        std::numeric_limits<double>::max(),
-        std::numeric_limits<double>::max(),
-        std::numeric_limits<double>::max()
+        (std::numeric_limits<double>::max)(),
+        (std::numeric_limits<double>::max)(),
+        (std::numeric_limits<double>::max)()
     };
     Vec3d max_pt{
         std::numeric_limits<double>::lowest(),

@@ -3,9 +3,9 @@
 
 /**
  * @file geo_kernel_c_api.h
- * @brief 空间几何内核跨语言扁平 C ABI 接口契约 (Flat C ABI, v2.0.0)
+ * @brief 空间几何内核跨语言扁平 C ABI 接口契约 (Flat C ABI)
  *
- * 完整覆盖第一阶段与第二阶段全部核心能力：
+ * 完整覆盖：
  *   1. 亿级 .dat 点云内存映射并发解析与 RTC 大坐标自动归化
  *   2. 并行莫顿码多级 LOD 点云八叉树构建、视锥体/SSE 调度与 GPU 二进制打包
  *   3. 空间分块邻接 Delaunay 三角网构建、高程精确内插、脏瓦片追踪与 GPU 网格导出
@@ -13,6 +13,7 @@
  *      多边形边界裁剪、多步增量撤销 Undo / 重做 Redo）
  *   5. 两期三角网高精度三棱柱叠加土方算量与实时网格微分热力图生成
  *   6. 向内/向外多级放坡建模、坡脚线/开挖边线提取（Daylighting）、原地面无缝缝合及放坡土方算量
+ *   7. 跨语言结构化诊断日志回调接口（避免 C++ DLL 与宿主进程之间发生 CRT stdio 模式冲突）
  */
 
 #include <stdbool.h>
@@ -62,6 +63,16 @@ typedef enum GeoStatus {
 } GeoStatus;
 
 /**
+ * @brief 内核结构化日志级别枚举（使用 GEO_LOG_LEVEL_* 前缀，避免与 C++ GEO_LOG_* 宏冲突）
+ */
+typedef enum GeoLogLevel {
+    GEO_LOG_LEVEL_DEBUG = 0,
+    GEO_LOG_LEVEL_INFO = 1,
+    GEO_LOG_LEVEL_WARN = 2,
+    GEO_LOG_LEVEL_ERROR = 3
+} GeoLogLevel;
+
+/**
  * @brief 原始文件坐标轴向排列规范
  */
 typedef enum GeoCoordOrder {
@@ -83,6 +94,16 @@ typedef enum GeoSurfaceSlot {
  * @brief C ABI 进度与取消回调函数指针
  */
 typedef bool (*GeoProgressCallback)(double progress, uint64_t processed_items, void* user_data);
+
+/**
+ * @brief C ABI 结构化日志回调函数指针（所有字符串均为 UTF-8 编码）
+ */
+typedef void (*GeoLogCallback)(
+    int32_t level,
+    const char* module_name,
+    const char* source_location,
+    const char* message,
+    void* user_data);
 
 /**
  * @brief 点云导入解析参数结构体
@@ -240,11 +261,12 @@ typedef struct GeoGradingSummary {
 } GeoGradingSummary;
 
 // ==============================================================================
-// 1. 生命周期与错误诊断接口
+// 1. 生命周期、日志桥接与错误诊断接口
 // ==============================================================================
 
 GEO_C_API const char* geo_get_version(void);
 GEO_C_API const char* geo_get_last_error(void);
+GEO_C_API void geo_set_log_callback(GeoLogCallback callback, void* user_data);
 GEO_C_API GeoProjectHandle geo_project_create(void);
 GEO_C_API void geo_project_destroy(GeoProjectHandle handle);
 
@@ -327,12 +349,9 @@ GEO_C_API GeoStatus geo_project_fetch_tin_tile_gpu_packet(
     size_t* out_byte_size);
 
 // ==============================================================================
-// 4. 三角网交互式动态拓扑编辑与 Undo/Redo 接口（第二阶段新增）
+// 4. 三角网交互式动态拓扑编辑与 Undo/Redo 接口
 // ==============================================================================
 
-/**
- * @brief 三维射线拾取三角网顶点、边与面片
- */
 GEO_C_API GeoStatus geo_project_pick_tin_ray(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -340,9 +359,6 @@ GEO_C_API GeoStatus geo_project_pick_tin_ray(
     const double ray_dir[3],
     GeoRayHitResult* out_hit);
 
-/**
- * @brief 翻转三角网对角线边（受断裂线约束保护，force_flip 为 true 时可强制翻转）
- */
 GEO_C_API GeoStatus geo_project_tin_flip_edge(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -350,18 +366,12 @@ GEO_C_API GeoStatus geo_project_tin_flip_edge(
     int32_t edge_slot,
     bool force_flip);
 
-/**
- * @brief 修改指定三角网顶点的局部高程 Z
- */
 GEO_C_API GeoStatus geo_project_tin_modify_vertex_z(
     GeoProjectHandle handle,
     int32_t surface_slot,
     uint32_t vertex_id,
     double new_local_z);
 
-/**
- * @brief 向三角网插入新顶点并局部恢复 Delaunay 性质
- */
 GEO_C_API GeoStatus geo_project_tin_insert_vertex(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -370,9 +380,6 @@ GEO_C_API GeoStatus geo_project_tin_insert_vertex(
     bool legalize_delaunay,
     uint32_t* out_vertex_id);
 
-/**
- * @brief 插入强制特征线/断裂线（xyz_array 为连续的 [x0,y0,z0, x1,y1,z1, ...] 双精度数组）
- */
 GEO_C_API GeoStatus geo_project_tin_insert_breakline(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -381,17 +388,11 @@ GEO_C_API GeoStatus geo_project_tin_insert_breakline(
     uint16_t code_id,
     bool interpolate_z_from_tin);
 
-/**
- * @brief 删除指定三角网内部顶点并重剖分星形空腔
- */
 GEO_C_API GeoStatus geo_project_tin_delete_vertex(
     GeoProjectHandle handle,
     int32_t surface_slot,
     uint32_t vertex_id);
 
-/**
- * @brief 按封闭多边形裁剪三角网（keep_inside=true 保留内部，false 挖除内部）
- */
 GEO_C_API GeoStatus geo_project_tin_clip_polygon(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -399,19 +400,9 @@ GEO_C_API GeoStatus geo_project_tin_clip_polygon(
     uint32_t point_count,
     bool keep_inside);
 
-/**
- * @brief 撤销最近一次三角网编辑操作
- */
 GEO_C_API GeoStatus geo_project_tin_undo(GeoProjectHandle handle, int32_t surface_slot);
-
-/**
- * @brief 重做最近一次被撤销的三角网编辑操作
- */
 GEO_C_API GeoStatus geo_project_tin_redo(GeoProjectHandle handle, int32_t surface_slot);
 
-/**
- * @brief 查询当前是否可执行撤销或重做
- */
 GEO_C_API GeoStatus geo_project_tin_get_history_state(
     GeoProjectHandle handle,
     int32_t surface_slot,
@@ -419,14 +410,9 @@ GEO_C_API GeoStatus geo_project_tin_get_history_state(
     bool* out_can_redo);
 
 // ==============================================================================
-// 5. 两期三角网高精度土方算量接口（第二阶段新增）
+// 5. 两期三角网高精度土方算量接口
 // ==============================================================================
 
-/**
- * @brief 计算两期三角网之间的精确三棱柱叠加土方量（支持零填挖等值线自动剖分）
- * @param roi_xyz_array 可选算量边界多边形顶点数组（传 NULL 表示计算全重叠区域）
- * @param roi_point_count 边界多边形顶点数
- */
 GEO_C_API GeoStatus geo_project_compute_earthwork_exact(
     GeoProjectHandle handle,
     int32_t period1_slot,
@@ -436,9 +422,6 @@ GEO_C_API GeoStatus geo_project_compute_earthwork_exact(
     uint32_t thread_count,
     GeoEarthworkSummary* out_summary);
 
-/**
- * @brief 执行并行网格微分法快速土方估算（用于交互预览）
- */
 GEO_C_API GeoStatus geo_project_compute_earthwork_grid(
     GeoProjectHandle handle,
     int32_t period1_slot,
@@ -450,32 +433,11 @@ GEO_C_API GeoStatus geo_project_compute_earthwork_grid(
     GeoEarthworkSummary* out_summary);
 
 // ==============================================================================
-// 6. 向内与向外多级放坡建模与土方计算接口（第二阶段新增）
+// 6. 向内与向外多级放坡建模与土方计算接口
 // ==============================================================================
 
-/**
- * @brief 获取默认多级放坡参数
- */
 GEO_C_API GeoGradingParams geo_default_grading_params(void);
 
-/**
- * @brief 执行向内或向外多级放坡建模、坡脚线求交提取、原地面缝合及放坡土方计算
- *
- * 计算完成后：
- *   - 纯放坡设计面自动写入 GEO_SURFACE_GRADING_DESIGN_ONLY (槽位 2)；
- *   - 若 generate_merged_terrain 为 true，缝合后的完整地形自动写入 GEO_SURFACE_GRADING_MERGED_TERRAIN (槽位 3)；
- *   - 前端可直接通过 geo_project_get_dirty_tin_tiles 与 geo_project_fetch_tin_tile_gpu_packet 拉取三维网格渲染。
- *
- * @param base_xyz_array 基准设计轮廓多边形顶点数组 [x0,y0,z0, x1,y1,z1, ...]
- * @param base_point_count 基准轮廓顶点数（至少 3 个）
- * @param stages 多级放坡配置数组
- * @param stage_count 放坡级数（至少 1 级）
- * @param params 放坡整体配置参数
- * @param generate_merged_terrain 是否同时生成与原地面缝合后的完整地形模型
- * @param out_daylight_xyz 可选输出缓冲区：接收坡脚线/开挖边线三维坐标 [x,y,z,...]（传 NULL 则跳过拷贝）
- * @param daylight_xyz_capacity 缓冲区可容纳的三维点数量上限
- * @param out_summary 输出完整放坡工程报告
- */
 GEO_C_API GeoStatus geo_project_compute_slope_grading(
     GeoProjectHandle handle,
     int32_t original_terrain_slot,

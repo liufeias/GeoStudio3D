@@ -2,10 +2,11 @@
 //!
 //! 设计规范：
 //!   1. 所有 `#[repr(C)]` 结构体与 `include/geo_kernel/geo_kernel_c_api.h` 严格逐字节对齐；
-//!   2. 严格路径加载策略：仅从当前桌面主程序（`geo-studio-3d.exe`）所在同级目录加载
+//!   2. 严格同级目录加载策略：仅从当前桌面主程序（`geo-studio-3d.exe`）所在同级目录加载
 //!      `GeoKernelCore.dll`（Linux 为 `libGeoKernelCore.so`，macOS 为 `libGeoKernelCore.dylib`），
-//!      禁止跨目录猜测或回退搜索系统环境变量路径，杜绝加载错误版本动态库的风险；
-//!   3. 若同级目录下不存在核心动态库或加载失败，返回包含精确期望路径与系统错误码的中文诊断信息；
+//!      禁止跨目录猜测路径；
+//!   3. 支持将 C++20 内核的结构化日志回调（`geo_set_log_callback`）安全桥接至 Rust 主日志系统，
+//!      消除双端各自操作控制台/日志文件导致的 UCRT 断言风险；
 //!   4. 暴露线程安全的 `SafeGeoProject` 句柄包装，析构时自动调用 `geo_project_destroy` 释放全部 C++ 内存。
 
 use libloading::{Library, Symbol};
@@ -184,11 +185,21 @@ pub struct GeoGradingSummary {
 
 pub type GeoProjectHandle = *mut c_void;
 pub type GeoProgressCallback = Option<extern "C" fn(f64, u64, *mut c_void) -> bool>;
+pub type GeoLogCallback = Option<
+    extern "C" fn(
+        level: i32,
+        module_name: *const c_char,
+        source_location: *const c_char,
+        message: *const c_char,
+        user_data: *mut c_void,
+    ),
+>;
 
 /// 动态加载的 C++20 几何内核函数表
 pub struct GeoKernelLib {
     _lib: Library,
     pub geo_get_last_error: unsafe extern "C" fn() -> *const c_char,
+    pub geo_set_log_callback: Option<unsafe extern "C" fn(GeoLogCallback, *mut c_void)>,
     pub geo_project_create: unsafe extern "C" fn() -> GeoProjectHandle,
     pub geo_project_destroy: unsafe extern "C" fn(GeoProjectHandle),
     pub geo_default_dat_load_params: unsafe extern "C" fn() -> GeoDatLoadParams,
@@ -304,7 +315,10 @@ pub struct GeoKernelLib {
 
 impl GeoKernelLib {
     /// 严格从当前可执行文件所在同级目录加载 `GeoKernelCore` 动态链接库（禁止跨目录猜测）
-    pub fn load_auto() -> Result<Self, String> {
+    pub fn load_auto<F>(mut log_fn: F) -> Result<Self, String>
+    where
+        F: FnMut(&str),
+    {
         #[cfg(target_os = "windows")]
         let lib_name = "GeoKernelCore.dll";
         #[cfg(target_os = "macos")]
@@ -320,6 +334,10 @@ impl GeoKernelLib {
 
         // 唯一合法加载路径：与主程序严格位于同一目录下的动态链接库
         let exact_dll_path = exe_dir.join(lib_name);
+        log_fn(&format!(
+            "正在检测核心几何内核动态库: {}",
+            exact_dll_path.display()
+        ));
 
         if !exact_dll_path.is_file() {
             return Err(format!(
@@ -338,7 +356,10 @@ impl GeoKernelLib {
             )
         })?;
 
-        unsafe { Self::bind_symbols(lib) }
+        log_fn("核心动态库装载成功，开始绑定全部 C ABI 符号...");
+        let bound = unsafe { Self::bind_symbols(lib)? };
+        log_fn("C++20 核心动态库全部 ABI 符号绑定完成");
+        Ok(bound)
     }
 
     unsafe fn bind_symbols(lib: Library) -> Result<Self, String> {
@@ -351,8 +372,14 @@ impl GeoKernelLib {
             }};
         }
 
+        let log_cb_sym: Option<unsafe extern "C" fn(GeoLogCallback, *mut c_void)> = lib
+            .get::<unsafe extern "C" fn(GeoLogCallback, *mut c_void)>(b"geo_set_log_callback\0")
+            .ok()
+            .map(|s| *s);
+
         Ok(Self {
             geo_get_last_error: load_sym!(geo_get_last_error, unsafe extern "C" fn() -> *const c_char),
+            geo_set_log_callback: log_cb_sym,
             geo_project_create: load_sym!(geo_project_create, unsafe extern "C" fn() -> GeoProjectHandle),
             geo_project_destroy: load_sym!(geo_project_destroy, unsafe extern "C" fn(GeoProjectHandle)),
             geo_default_dat_load_params: load_sym!(geo_default_dat_load_params, unsafe extern "C" fn() -> GeoDatLoadParams),
@@ -440,6 +467,14 @@ impl GeoKernelLib {
             ),
             _lib: lib,
         })
+    }
+
+    pub fn set_log_callback(&self, cb: GeoLogCallback) {
+        if let Some(func) = self.geo_set_log_callback {
+            unsafe {
+                func(cb, ptr::null_mut());
+            }
+        }
     }
 
     pub fn last_error_string(&self) -> String {

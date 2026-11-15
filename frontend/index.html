@@ -4,6 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GeoStudio 3D — 亿级点云三角网与土方放坡工程系统</title>
+  <!--
+    在文档解析最早期（模块脚本加载完成之前）即注册全局捕获阶段右键拦截器：
+    1. 彻底阻止 WebView2 / WebKitGTK / WKWebView 弹出浏览器默认 HTML 右键菜单（返回、刷新、另存为、打印等）。
+    2. 仅调用 preventDefault()，不阻断事件传播，确保 Three.js OrbitControls 右键平移与画布右键结束绘制交互正常触发。
+  -->
+  <script>
+    (function () {
+      var suppressHtmlContextMenu = function (event) {
+        event.preventDefault();
+      };
+      window.addEventListener('contextmenu', suppressHtmlContextMenu, { capture: true });
+      document.addEventListener('contextmenu', suppressHtmlContextMenu, { capture: true });
+    })();
+  </script>
   <link rel="stylesheet" href="/src/styles/app.css" />
 </head>
 <body>
@@ -14,7 +28,6 @@
         <span class="brand-badge">GEO KERNEL v2.0</span>
         <h1 class="brand-title">三维测绘点云与土方放坡设计系统</h1>
       </div>
-
       <div class="toolbar-actions">
         <button id="btn-import-p1" class="btn btn-primary" title="导入第一期原始地面 .dat 点云">
           导入第一期原地面 (.dat)
@@ -35,7 +48,6 @@
         </button>
       </div>
     </header>
-
     <!-- 主工作区：左侧图层与显示控制 + 中央 3D 视口 + 右侧工程算量与放坡参数面板 -->
     <main class="workspace-body">
       <!-- 左侧面板：图层开关、着色器模式、三角网交互编辑工具 -->
@@ -63,7 +75,6 @@
             <span>缝合后完整设计地形</span>
           </label>
         </section>
-
         <section class="panel-card">
           <h2 class="card-title">三维渲染着色模式</h2>
           <div class="form-group">
@@ -92,7 +103,6 @@
             <input type="number" id="num-tin-decimate" class="form-control" value="0.5" min="0" max="50" step="0.1" />
           </div>
         </section>
-
         <section class="panel-card">
           <h2 class="card-title">三角网交互式拓扑编辑</h2>
           <div class="tool-grid">
@@ -112,25 +122,21 @@
           </div>
         </section>
       </aside>
-
       <!-- 中央 WebGL2 / Three.js 三维主视口 -->
       <section class="viewport-container">
         <canvas id="gl-canvas"></canvas>
-
         <!-- 左上角实时渲染性能与数据统计 HUD -->
         <div class="hud-overlay hud-top-left">
           <div>FPS: <span id="hud-fps">60</span> | 可视点数: <span id="hud-vis-pts">0</span></div>
           <div>TIN 三角形: <span id="hud-tin-tris">0</span> | 显存瓦片: <span id="hud-gpu-tiles">0</span></div>
           <div>RTC 原点: <span id="hud-rtc-origin">未加载</span></div>
         </div>
-
         <!-- 底部状态栏与光标实时大地坐标读数 -->
         <div class="hud-overlay hud-bottom-bar">
           <span id="hud-cursor-coord">大地坐标: E = ---, N = ---, H = ---</span>
           <span id="hud-status-msg">内核就绪，请导入测绘 .dat 点云文件</span>
         </div>
       </section>
-
       <!-- 右侧面板：两期土方算量 + 向内/向外多级放坡建模 -->
       <aside class="side-panel right-panel">
         <section class="panel-card">
@@ -147,7 +153,6 @@
             <div class="result-item"><span>重叠面积:</span><strong id="res-ew-area">0.00 m²</strong></div>
           </div>
         </section>
-
         <section class="panel-card">
           <h2 class="card-title">向内 / 向外多级放坡设计</h2>
           <div class="form-row-2">
@@ -167,7 +172,6 @@
               </select>
             </div>
           </div>
-
           <div class="form-row-2">
             <div class="form-group">
               <label for="num-grade-elev">设计平台高程 (大地 H)</label>
@@ -178,7 +182,6 @@
               <input type="number" id="num-grade-step" class="form-control" value="1.5" min="0.2" max="20" step="0.1" />
             </div>
           </div>
-
           <label class="checkbox-row">
             <input type="checkbox" id="chk-grade-daylight" checked />
             <span>自动与原地面求交生成坡脚线 (Daylighting)</span>
@@ -187,19 +190,16 @@
             <input type="checkbox" id="chk-grade-stitch" checked />
             <span>生成与原地面无缝缝合完整地形</span>
           </label>
-
           <!-- 多级边坡参数表 -->
           <div class="stages-header">
             <span>分级边坡与马道配置</span>
             <button id="btn-add-stage" class="btn btn-sm btn-secondary">+ 添加一级</button>
           </div>
           <div id="grading-stages-list" class="stages-list"></div>
-
           <div class="inline-actions" style="margin-top: 8px;">
             <button id="btn-draw-grade-poly" class="btn btn-secondary">框选/绘制设计轮廓</button>
             <button id="btn-run-grading" class="btn btn-primary">生成放坡与算量</button>
           </div>
-
           <div class="result-grid" style="margin-top: 10px;">
             <div class="result-item"><span>放坡挖方:</span><strong id="res-gr-cut">0.00 m³</strong></div>
             <div class="result-item"><span>放坡填方:</span><strong id="res-gr-fill">0.00 m³</strong></div>
@@ -212,8 +212,6 @@
       </aside>
     </main>
   </div>
-
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>
-

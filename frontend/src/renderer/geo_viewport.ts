@@ -2,17 +2,21 @@
  * @file geo_viewport.ts
  * @brief Z-up 测绘三维交互主视口（双通道 EDL 眼罩光照 + 三角网实体渲染 + 轨道控制器 + 射线拾取）
  *
- * 渲染管线架构：
- *   - 通道 1（仅当点云可见时执行）：将八叉树点云渲染至带高精度浮点/线性深度纹理的离屏
- *     `WebGLRenderTarget`，随后运行全屏 EDL 眼罩光照着色器合成立体点云至主帧缓冲。
- *   - 通道 2（开启深度缓冲叠加）：在保留点云深度缓冲的前提下，将第一期原地面 TIN、第二期
- *     目标面 TIN、多级放坡设计面、缝合地形以及三维交互矢量草图/坡脚线叠加绘制到主视口，
- *     实现点云与三角网毫米级空间穿插遮挡融合。
+ * 渲染与交互工程规范：
+ *   1. 双通道混合渲染：
+ *      - 通道 1（点云可见时执行）：将八叉树点云渲染至带高精度深度纹理的离屏 `WebGLRenderTarget`，
+ *        随后运行全屏 EDL 眼罩光照着色器合成立体点云至主帧缓冲。
+ *      - 通道 2：在主帧缓冲叠加绘制三角网实体、等高线、多级放坡坡体与交互矢量标注。
+ *   2. 交互保护：
+ *      - 画布层明确拦截 `contextmenu` 阻止任何默认 HTML 右键菜单弹出，同时完整保留右键轨道平移
+ *        与右键结束多段线绘制功能。
+ *   3. Debug 诊断增强：
+ *      - 捕获并记录 WebGL 上下文异常、拾取命令错误（不再静默吞错）及相机/视口变更详情；
+ *        Release 模式零开销跳过。
  */
-
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { IGeoKernelBridge } from '../bridge/kernel_bridge';
+import { IGeoKernelBridge, frontendLogger } from '../bridge/kernel_bridge';
 import { RayHitResult, SurfaceSlot } from '../types/geo_protocol';
 import {
   createEdlPostProcessMaterial,
@@ -35,33 +39,27 @@ export interface ViewportPickEvent {
 export class GeoViewport3D {
   private readonly canvas: HTMLCanvasElement;
   private readonly bridge: IGeoKernelBridge;
-
   private readonly renderer: THREE.WebGLRenderer;
   private readonly camera: THREE.PerspectiveCamera;
   private readonly controls: OrbitControls;
-
   // 独立点云场景与独立三角网/矢量标注场景（支持双通道 EDL 混合深度合成）
   private readonly pointCloudScene: THREE.Scene;
   private readonly meshOverlayScene: THREE.Scene;
-
   // EDL 离屏渲染目标与全屏合成 Quad
   private edlRenderTarget: THREE.WebGLRenderTarget;
   private readonly edlQuadScene: THREE.Scene;
   private readonly edlQuadCamera: THREE.OrthographicCamera;
   private readonly edlMaterial: THREE.ShaderMaterial;
-
   // 材质与图层管理器
   private readonly pointMaterial: THREE.ShaderMaterial;
   private readonly octreeP1: OctreeLodManager;
   private readonly tinManagers = new Map<SurfaceSlot, TinTileManager>();
-
   // 交互矢量叠加组（特征线草图、放坡轮廓、坡脚线、高亮拾取点）
   private readonly vectorOverlayGroup: THREE.Group;
   private draftLineObj: THREE.Line | null = null;
   private daylightLineObj: THREE.Line | null = null;
   private gradingBaseLineObj: THREE.Line | null = null;
   private cursorMarkerObj: THREE.Mesh;
-
   // 回调函数
   public onCursorTerrainMove?: (localPos: [number, number, number] | null) => void;
   public onViewportClickPick?: (event: ViewportPickEvent) => void;
@@ -72,12 +70,15 @@ export class GeoViewport3D {
   private currentFps = 60;
   private pointerDownPos = new THREE.Vector2();
   private lastRayPickTime = 0;
+  private lastLoggedMoveErrorTime = 0;
 
   constructor(canvas: HTMLCanvasElement, bridge: IGeoKernelBridge) {
     this.canvas = canvas;
     this.bridge = bridge;
 
-    // 1. 初始化 WebGL2 渲染器（开启抗锯齿与对数/高精深度缓冲）
+    frontendLogger.info('VIEWPORT', '正在初始化 WebGL2 Z-up 三维工程主视口...');
+
+    // 1. 初始化 WebGL2 渲染器（开启抗锯齿与高精深度缓冲）
     this.renderer = new THREE.WebGLRenderer({
       canvas: this.canvas,
       antialias: true,
@@ -139,7 +140,6 @@ export class GeoViewport3D {
         })
       )
     );
-
     this.tinManagers.set(
       SurfaceSlot.Period2Target,
       new TinTileManager(
@@ -155,7 +155,6 @@ export class GeoViewport3D {
         })
       )
     );
-
     this.tinManagers.set(
       SurfaceSlot.GradingDesignOnly,
       new TinTileManager(
@@ -171,7 +170,6 @@ export class GeoViewport3D {
         })
       )
     );
-
     const mergedMgr = new TinTileManager(
       this.bridge,
       SurfaceSlot.GradingMergedTerrain,
@@ -199,16 +197,38 @@ export class GeoViewport3D {
     this.cursorMarkerObj.renderOrder = 999;
     this.vectorOverlayGroup.add(this.cursorMarkerObj);
 
-    // 8. 绑定尺寸自适应与鼠标交互事件
+    // 8. 绑定尺寸自适应、WebGL 上下文保护、画布右键菜单屏蔽与鼠标交互事件
     this.handleResize();
     window.addEventListener('resize', this.handleResize);
+    this.canvas.addEventListener('contextmenu', this.handleCanvasContextMenu);
+    this.canvas.addEventListener('webglcontextlost', this.handleContextLost);
+    this.canvas.addEventListener('webglcontextrestored', this.handleContextRestored);
     this.canvas.addEventListener('pointerdown', this.handlePointerDown);
     this.canvas.addEventListener('pointermove', this.handlePointerMove);
     this.canvas.addEventListener('pointerup', this.handlePointerUp);
 
+    frontendLogger.info(
+      'VIEWPORT',
+      () => `WebGL2 视口初始化完成 | 初始尺寸: ${initW}x${initH}, DPR: ${this.renderer.getPixelRatio()}`
+    );
+
     // 启动 60FPS 主渲染循环
     this.startRenderLoop();
   }
+
+  private handleCanvasContextMenu = (e: MouseEvent): void => {
+    // 严格阻止浏览器/WebView 默认右键菜单，确保右键拖拽与右键完成绘制体验纯净
+    e.preventDefault();
+  };
+
+  private handleContextLost = (e: Event): void => {
+    e.preventDefault();
+    frontendLogger.error('VIEWPORT', '检测到 WebGL 上下文丢失 (webglcontextlost)！渲染已暂停等待恢复');
+  };
+
+  private handleContextRestored = (): void => {
+    frontendLogger.info('VIEWPORT', 'WebGL 上下文已自动恢复 (webglcontextrestored)');
+  };
 
   private createEdlTarget(width: number, height: number): THREE.WebGLRenderTarget {
     const target = new THREE.WebGLRenderTarget(width, height, {
@@ -239,12 +259,13 @@ export class GeoViewport3D {
     this.edlRenderTarget = this.createEdlTarget(rtW, rtH);
     this.edlMaterial.uniforms.uResolution.value.set(rtW, rtH);
     this.pointMaterial.uniforms.uViewportHeight.value = rtH;
+
+    frontendLogger.debug('VIEWPORT', () => `视口尺寸自适应更新: CSS=${width}x${height}, RT=${rtW}x${rtH}`);
   };
 
   // ============================================================================
   // 公开控制与数据同步接口
   // ============================================================================
-
   getOctreeManager(): OctreeLodManager {
     return this.octreeP1;
   }
@@ -252,7 +273,9 @@ export class GeoViewport3D {
   getTinManager(slot: SurfaceSlot): TinTileManager {
     const mgr = this.tinManagers.get(slot);
     if (!mgr) {
-      throw new Error(`未找到槽位 ${slot} 对应的三角网渲染管理器`);
+      const msg = `未找到槽位 ${slot} 对应的三角网渲染管理器`;
+      frontendLogger.error('VIEWPORT', msg);
+      throw new Error(msg);
     }
     return mgr;
   }
@@ -263,10 +286,12 @@ export class GeoViewport3D {
     for (const mgr of this.tinManagers.values()) {
       mgr.updateElevationRange(minZ, maxZ);
     }
+    frontendLogger.debug('VIEWPORT', () => `全局高程色带范围更新: [${minZ.toFixed(3)}, ${maxZ.toFixed(3)}] m`);
   }
 
   setEdlEnabled(enabled: boolean): void {
     this.edlMaterial.uniforms.uEnableEdl.value = enabled ? 1 : 0;
+    frontendLogger.debug('VIEWPORT', () => `EDL 眼罩光照开关切换为: ${enabled}`);
   }
 
   setAllTinRenderMode(mode: TinRenderMode): void {
@@ -287,7 +312,6 @@ export class GeoViewport3D {
     const cx = 0.5 * (minPt[0] + maxPt[0]);
     const cy = 0.5 * (minPt[1] + maxPt[1]);
     const cz = 0.5 * (minPt[2] + maxPt[2]);
-
     const spanX = Math.max(10, maxPt[0] - minPt[0]);
     const spanY = Math.max(10, maxPt[1] - minPt[1]);
     const diag = Math.hypot(spanX, spanY);
@@ -298,6 +322,11 @@ export class GeoViewport3D {
     this.camera.far = Math.max(20000, diag * 25.0);
     this.camera.updateProjectionMatrix();
     this.controls.update();
+
+    frontendLogger.info(
+      'VIEWPORT',
+      () => `相机已居中对齐至包围盒: center=(${cx.toFixed(2)}, ${cy.toFixed(2)}, ${cz.toFixed(2)}), diag=${diag.toFixed(2)} m`
+    );
   }
 
   /**
@@ -344,7 +373,6 @@ export class GeoViewport3D {
       this.daylightLineObj.geometry.dispose();
       this.daylightLineObj = null;
     }
-
     if (basePoly.length >= 3) {
       const verts: number[] = [];
       for (const p of basePoly) verts.push(p[0], p[1], p[2] + 0.12);
@@ -356,7 +384,6 @@ export class GeoViewport3D {
       this.gradingBaseLineObj.renderOrder = 940;
       this.vectorOverlayGroup.add(this.gradingBaseLineObj);
     }
-
     if (daylightPoly.length >= 2) {
       const verts: number[] = [];
       for (const p of daylightPoly) verts.push(p[0], p[1], p[2] + 0.12);
@@ -392,7 +419,6 @@ export class GeoViewport3D {
   // ============================================================================
   // 鼠标三维射线计算与交互拾取
   // ============================================================================
-
   private computeScreenRay(clientX: number, clientY: number): {
     origin: [number, number, number];
     dir: [number, number, number];
@@ -400,10 +426,8 @@ export class GeoViewport3D {
     const rect = this.canvas.getBoundingClientRect();
     const ndcX = ((clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
     const ndcY = -((clientY - rect.top) / Math.max(1, rect.height)) * 2 + 1;
-
     const raycaster = new THREE.Raycaster();
     raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this.camera);
-
     const o = raycaster.ray.origin;
     const d = raycaster.ray.direction;
     return {
@@ -447,8 +471,12 @@ export class GeoViewport3D {
           this.onCursorTerrainMove?.(null);
         }
       })
-      .catch(() => {
-        // 忽略未加载完时的瞬时拾取错误
+      .catch((err) => {
+        // 限频记录光标悬停拾取异常（1 秒最多打印一次，防止刷屏同时保证不丢失错误线索）
+        if (frontendLogger.isEnabled() && now - this.lastLoggedMoveErrorTime > 1000) {
+          this.lastLoggedMoveErrorTime = now;
+          frontendLogger.warn('PICK', '光标实时悬停射线拾取异常', err);
+        }
       });
   };
 
@@ -461,9 +489,31 @@ export class GeoViewport3D {
     if (moveDist > 4.0) return;
 
     const ray = this.computeScreenRay(e.clientX, e.clientY);
+    if (this.tinManagers.get(SurfaceSlot.Period1Original)?.getLoadedTileCount() === 0) {
+      // 未导入三角网时仍支持右键结束等纯按钮事件透传
+      this.onViewportClickPick?.({
+        button: e.button,
+        rayOrigin: ray.origin,
+        rayDir: ray.dir,
+        hit: {
+          hit: false,
+          triangleId: 0xffffffff,
+          nearestVertexId: 0xffffffff,
+          nearestEdgeSlot: -1,
+          distance: 0,
+          hitLocalPos: [0, 0, 0],
+        },
+      });
+      return;
+    }
+
     void this.bridge
       .pickTinByRay(SurfaceSlot.Period1Original, ray.origin, ray.dir)
       .then((hit) => {
+        frontendLogger.debug(
+          'PICK',
+          () => `点击拾取(button=${e.button}): hit=${hit.hit}, tri=${hit.triangleId}, vid=${hit.nearestVertexId}, edge=${hit.nearestEdgeSlot}`
+        );
         this.onViewportClickPick?.({
           button: e.button,
           rayOrigin: ray.origin,
@@ -471,62 +521,68 @@ export class GeoViewport3D {
           hit,
         });
       })
-      .catch(() => {});
+      .catch((err) => {
+        frontendLogger.error('PICK', () => `点击射线拾取失败 (button=${e.button})`, err);
+      });
   };
 
   // ============================================================================
   // 60FPS 双通道主渲染循环
   // ============================================================================
-
   private startRenderLoop(): void {
     const tick = (): void => {
       this.animFrameId = requestAnimationFrame(tick);
+      try {
+        this.controls.update();
 
-      this.controls.update();
+        const dpr = this.renderer.getPixelRatio();
+        const viewportH = Math.max(1, this.canvas.clientHeight * dpr);
+        this.octreeP1.update(this.camera, viewportH);
 
-      const dpr = this.renderer.getPixelRatio();
-      const viewportH = Math.max(1, this.canvas.clientHeight * dpr);
-      this.octreeP1.update(this.camera, viewportH);
+        // 通道 1：将点云八叉树渲染到 EDL 离屏目标并执行深度梯度阴影合成
+        this.renderer.setRenderTarget(this.edlRenderTarget);
+        this.renderer.clear(true, true, true);
+        if (this.octreeP1.getVisiblePointCount() > 0) {
+          this.renderer.render(this.pointCloudScene, this.camera);
+        }
 
-      // 通道 1：将点云八叉树渲染到 EDL 离屏目标并执行深度梯度阴影合成
-      this.renderer.setRenderTarget(this.edlRenderTarget);
-      this.renderer.clear(true, true, true);
-      if (this.octreeP1.getVisiblePointCount() > 0) {
-        this.renderer.render(this.pointCloudScene, this.camera);
-      }
+        // 将离屏点云颜色与深度缓冲区输出到屏幕主帧缓冲
+        this.renderer.setRenderTarget(null);
+        this.renderer.clear(true, true, true);
+        this.edlMaterial.uniforms.tColor.value = this.edlRenderTarget.texture;
+        this.edlMaterial.uniforms.tDepth.value = this.edlRenderTarget.depthTexture;
+        this.edlMaterial.uniforms.uCameraNear.value = this.camera.near;
+        this.edlMaterial.uniforms.uCameraFar.value = this.camera.far;
+        this.renderer.render(this.edlQuadScene, this.edlQuadCamera);
 
-      // 将离屏点云颜色与深度缓冲区输出到屏幕主帧缓冲
-      this.renderer.setRenderTarget(null);
-      this.renderer.clear(true, true, true);
+        // 通道 2：在主帧缓冲上叠加渲染三维三角网实体、等高线、多级放坡坡体与交互矢量线
+        this.renderer.clearDepth();
+        this.renderer.render(this.meshOverlayScene, this.camera);
 
-      this.edlMaterial.uniforms.tColor.value = this.edlRenderTarget.texture;
-      this.edlMaterial.uniforms.tDepth.value = this.edlRenderTarget.depthTexture;
-      this.edlMaterial.uniforms.uCameraNear.value = this.camera.near;
-      this.edlMaterial.uniforms.uCameraFar.value = this.camera.far;
-      this.renderer.render(this.edlQuadScene, this.edlQuadCamera);
-
-      // 通道 2：在主帧缓冲上叠加渲染三维三角网实体、等高线、多级放坡坡体与交互矢量线
-      this.renderer.clearDepth();
-      this.renderer.render(this.meshOverlayScene, this.camera);
-
-      // 统计实时 FPS
-      ++this.frameCountSinceLastFps;
-      const now = performance.now();
-      if (now - this.lastFpsTime >= 500) {
-        this.currentFps = Math.round(
-          (this.frameCountSinceLastFps * 1000) / (now - this.lastFpsTime)
-        );
-        this.frameCountSinceLastFps = 0;
-        this.lastFpsTime = now;
+        // 统计实时 FPS
+        ++this.frameCountSinceLastFps;
+        const now = performance.now();
+        if (now - this.lastFpsTime >= 500) {
+          this.currentFps = Math.round(
+            (this.frameCountSinceLastFps * 1000) / (now - this.lastFpsTime)
+          );
+          this.frameCountSinceLastFps = 0;
+          this.lastFpsTime = now;
+        }
+      } catch (err) {
+        frontendLogger.error('RENDER', '主渲染循环单帧执行发生未预期异常', err);
       }
     };
-
     tick();
   }
 
   dispose(): void {
+    frontendLogger.info('VIEWPORT', '正在销毁三维主视口并释放 WebGL 显存资源');
     cancelAnimationFrame(this.animFrameId);
     window.removeEventListener('resize', this.handleResize);
+    this.canvas.removeEventListener('contextmenu', this.handleCanvasContextMenu);
+    this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
+    this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored);
     this.canvas.removeEventListener('pointerdown', this.handlePointerDown);
     this.canvas.removeEventListener('pointermove', this.handlePointerMove);
     this.canvas.removeEventListener('pointerup', this.handlePointerUp);
@@ -538,4 +594,3 @@ export class GeoViewport3D {
     this.renderer.dispose();
   }
 }
-

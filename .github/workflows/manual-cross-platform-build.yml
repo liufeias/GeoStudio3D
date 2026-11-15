@@ -6,7 +6,7 @@
 #   1. 严格手动触发（仅 workflow_dispatch）：在 Actions 页面点击 "Run workflow" 启动。
 #   2. 可视化自由勾选构建平台：支持 Windows、Linux、macOS、WebAssembly (WASM) 任意组合。
 #   3. 全链路原生 Node 24 Actions (checkout@v5 / setup-node@v5 / cache@v5 / upload-artifact@v6)
-#      + 原生 vswhere/vcvars64 批处理激活，零 Node.js 20 弃用警告且无引号转义故障。
+#      + 原生 vswhere/vcvars64 批处理激活，明确锁定 cl.exe 编译器，避免 LLVM/Clang 混用。
 #   4. 规范化输出三大独立 ZIP 产物包 + 强制诊断日志包：
 #      - 产物 1（源码包）：`GeoStudio3D-source.zip`（完整纯净项目源码，不含临时编译目录）
 #      - 产物 2（可执行程序包）：`GeoStudio3D-<平台>-executable.zip`（仅含同目录主程序、
@@ -438,7 +438,6 @@ jobs:
           if not os.path.isfile(vcvars):
               raise RuntimeError(f"未找到 vcvars64.bat: {vcvars}")
 
-          # 写入临时批处理文件再调用 cmd.exe /d /c，彻底规避 CreateProcess 双引号转义问题
           bat_script = (
               "@echo off\r\n"
               f'call "{vcvars}" >nul\r\n'
@@ -614,13 +613,24 @@ jobs:
             echo "==================== 02. C++20 几何内核配置与编译 ===================="
             echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
+            EXTRA_CMAKE_ARGS=()
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              # 若旧构建缓存中记录了 Clang 编译器，自动清理缓存以确保切换到原生 MSVC cl.exe
+              if [[ -f "build/CMakeCache.txt" ]] && grep -qi "clang" "build/CMakeCache.txt"; then
+                echo "[缓存清理] 检测到旧缓存使用了 Clang 编译器，正在清理 build/ 以切换到原生 MSVC cl.exe..."
+                rm -rf build
+              fi
+              EXTRA_CMAKE_ARGS+=(-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl)
+            fi
+
             cmake -S . -B build \
               -G "${CMAKE_GEN}" \
               -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
               -DCMAKE_VERBOSE_MAKEFILE=ON \
               -DGEO_BUILD_SHARED=ON \
               -DGEO_BUILD_BENCHMARK=ON \
-              -DGEO_ENABLE_ARCH_OPT=ON
+              -DGEO_ENABLE_ARCH_OPT=ON \
+              "${EXTRA_CMAKE_ARGS[@]}"
 
             echo "------------------------------------------------------------------"
             echo "[开始增量并行编译 C++20 源码]"
@@ -1133,7 +1143,6 @@ jobs:
           sdk_root = f"{sdk_stage}/GeoStudio3D-{plat}-sdk"
           sdk_zip = f"release-zips/GeoStudio3D-{plat}-sdk.zip"
 
-          # 1. 写入可执行程序包中文说明
           exe_readme = (
               "======================================================================\n"
               f"  GeoStudio 3D ({plat}) 可执行程序绿色发行包\n"
@@ -1149,7 +1158,6 @@ jobs:
           with open(os.path.join(exe_root, "README_运行说明.txt"), "w", encoding="utf-8", newline="\r\n") as f:
               f.write(exe_readme)
 
-          # 2. 写入二次开发导入库 SDK 包 CMake 配置文件（使用普通字符串，避免 YAML 解析误识别双花括号）
           cmake_config = "\n".join([
               f"# GeoKernelCore CMake 导入库配置文件 ({plat})",
               'get_filename_component(_GEO_SDK_PREFIX "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)',
@@ -1249,7 +1257,6 @@ jobs:
 
   # ============================================================================
   # 阶段 2：WebAssembly (Emscripten WASM) 跨端目标构建（勾选 build_wasm 时运行）
-  # 同样分别输出可执行 Web 应用 ZIP 与二次开发静态导入库 SDK ZIP
   # ============================================================================
   build-wasm-target:
     name: "构建 [WebAssembly (Emscripten WASM)]"

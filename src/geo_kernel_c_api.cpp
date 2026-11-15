@@ -1,5 +1,6 @@
 #include "geo_kernel/geo_kernel_c_api.h"
 
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -9,6 +10,18 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#if defined(_WIN32)
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <fcntl.h>
+    #include <io.h>
+    #include <windows.h>
+#endif
 
 #include "geo_kernel/core_types.hpp"
 #include "geo_kernel/dat_parser.hpp"
@@ -25,8 +38,69 @@ constexpr int32_t kMaxSurfaceSlots = 4;
 
 thread_local std::string g_last_error_message;
 
+std::mutex g_log_callback_mutex;
+GeoLogCallback g_log_callback = nullptr;
+void* g_log_callback_user_data = nullptr;
+
+/**
+ * @brief Windows UCRT 标准流文本模式安全守卫
+ *
+ * 根因防护：
+ *   Windows 通用 C 运行时（尤其是 Debug 版 ucrtbased.dll）在任意窄字符 stdio 输出
+ *   （printf / fprintf / std::cout / std::cerr）执行时，会强制断言校验：
+ *     (_textmode_safe(fn) == __crt_lowio_text_mode::ansi) && !_tm_unicode_safe(fn)
+ *   本函数仅在文件描述符有效且关联真实操作系统句柄时，将其安全恢复为 _O_TEXT 模式。
+ */
+void EnsureSafeWindowsStdioMode() noexcept {
+#if defined(_WIN32)
+    auto sanitize_stream = [](FILE* stream) noexcept {
+        if (stream == nullptr) return;
+        const int fd = _fileno(stream);
+        if (fd < 0) return;
+        const intptr_t os_handle = _get_osfhandle(fd);
+        if (os_handle == -1 || os_handle == 0) return;
+        (void)_setmode(fd, _O_TEXT);
+    };
+    sanitize_stream(stdout);
+    sanitize_stream(stderr);
+#endif
+}
+
+/**
+ * @brief 将 UTF-8 字符串直接输出到 Windows 控制台或标准错误句柄（完全绕过 UCRT FILE* 断言）
+ */
+void WriteUtf8ToStderrBypassUcrt(std::string_view utf8_line) noexcept {
+#if defined(_WIN32)
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr == nullptr || hErr == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD console_mode = 0;
+    if (GetConsoleMode(hErr, &console_mode)) {
+        const int wlen = MultiByteToWideChar(
+            CP_UTF8, 0, utf8_line.data(), static_cast<int>(utf8_line.size()), nullptr, 0);
+        if (wlen > 0) {
+            std::wstring wbuf(static_cast<size_t>(wlen), L'\0');
+            MultiByteToWideChar(
+                CP_UTF8, 0, utf8_line.data(), static_cast<int>(utf8_line.size()), wbuf.data(), wlen);
+            DWORD written = 0;
+            WriteConsoleW(hErr, wbuf.data(), static_cast<DWORD>(wbuf.size()), &written, nullptr);
+        }
+    } else {
+        DWORD written = 0;
+        WriteFile(hErr, utf8_line.data(), static_cast<DWORD>(utf8_line.size()), &written, nullptr);
+    }
+#else
+    if (!utf8_line.empty()) {
+        (void)std::fwrite(utf8_line.data(), 1, utf8_line.size(), stderr);
+        (void)std::fflush(stderr);
+    }
+#endif
+}
+
 void SetLastError(const std::string& msg) {
     g_last_error_message = msg;
+    GEO_LOG_ERROR(msg);
 }
 
 void ClearLastError() {
@@ -86,6 +160,77 @@ void FillEarthworkSummary(
 
 }  // namespace
 
+// ==============================================================================
+// 实现 core_types.hpp 声明的跨模块统一日志分发函数 geo_kernel::detail::WriteKernelLog
+// ==============================================================================
+
+namespace geo_kernel::detail {
+
+void WriteKernelLog(
+    int32_t level,
+    const char* file_path,
+    int line_no,
+    const char* func_name,
+    std::string_view message) noexcept {
+    try {
+        const char* base_name = file_path;
+        if (file_path != nullptr) {
+            for (const char* p = file_path; *p != '\0'; ++p) {
+                if (*p == '/' || *p == '\\') {
+                    base_name = p + 1;
+                }
+            }
+        }
+
+        char loc_buf[256];
+        std::snprintf(
+            loc_buf,
+            sizeof(loc_buf),
+            "%s:%d %s",
+            base_name != nullptr ? base_name : "unknown",
+            line_no,
+            func_name != nullptr ? func_name : "");
+
+        GeoLogCallback cb = nullptr;
+        void* user_data = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_log_callback_mutex);
+            cb = g_log_callback;
+            user_data = g_log_callback_user_data;
+        }
+
+        if (cb != nullptr) {
+            std::string msg_copy(message);
+            cb(level, "CPP:KERNEL", loc_buf, msg_copy.c_str(), user_data);
+            return;
+        }
+
+        const char* level_str = "INFO ";
+        switch (level) {
+            case GEO_LOG_LEVEL_DEBUG: level_str = "DEBUG"; break;
+            case GEO_LOG_LEVEL_INFO:  level_str = "INFO "; break;
+            case GEO_LOG_LEVEL_WARN:  level_str = "WARN "; break;
+            case GEO_LOG_LEVEL_ERROR: level_str = "ERROR"; break;
+            default: break;
+        }
+
+        std::string line;
+        line.reserve(message.size() + 128);
+        line.append("[");
+        line.append(level_str);
+        line.append("] [CPP:KERNEL] (");
+        line.append(loc_buf);
+        line.append(") ");
+        line.append(message.data(), message.size());
+        line.append("\n");
+        WriteUtf8ToStderrBypassUcrt(line);
+    } catch (...) {
+        // 日志输出过程严禁向外抛出任何异常
+    }
+}
+
+}  // namespace geo_kernel::detail
+
 struct GeoProjectOpaque {
     mutable std::shared_mutex rw_mutex;
     geo_kernel::RtcTransform shared_rtc;
@@ -127,11 +272,23 @@ const char* geo_get_last_error(void) {
     return g_last_error_message.c_str();
 }
 
+void geo_set_log_callback(GeoLogCallback callback, void* user_data) {
+    EnsureSafeWindowsStdioMode();
+    std::lock_guard<std::mutex> lock(g_log_callback_mutex);
+    g_log_callback = callback;
+    g_log_callback_user_data = user_data;
+}
+
 GeoProjectHandle geo_project_create(void) {
     try {
+        EnsureSafeWindowsStdioMode();
         geo_kernel::ExactPredicates::Initialize();
         ClearLastError();
-        return new GeoProjectOpaque();
+        auto* project = new GeoProjectOpaque();
+        char ptr_buf[64];
+        std::snprintf(ptr_buf, sizeof(ptr_buf), "%p", static_cast<void*>(project));
+        GEO_LOG_INFO(std::string("geo_project_create 创建工程上下文成功: ptr=") + ptr_buf);
+        return project;
     } catch (...) {
         SetLastError("创建工程实例时内存分配失败");
         return nullptr;
@@ -139,6 +296,11 @@ GeoProjectHandle geo_project_create(void) {
 }
 
 void geo_project_destroy(GeoProjectHandle handle) {
+    if (handle != nullptr) {
+        char ptr_buf[64];
+        std::snprintf(ptr_buf, sizeof(ptr_buf), "%p", static_cast<void*>(handle));
+        GEO_LOG_INFO(std::string("geo_project_destroy 销毁工程上下文: ptr=") + ptr_buf);
+    }
     delete handle;
 }
 
@@ -263,6 +425,9 @@ GeoStatus geo_project_load_dat(
             out_summary->local_max[2] = stats.local_bounds.max_pt.z;
         }
 
+        GEO_LOG_INFO(
+            "点云加载完成: 槽位=" + std::to_string(surface_slot) +
+            ", 有效点数=" + std::to_string(stats.valid_points));
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (const std::bad_alloc&) {
@@ -328,6 +493,9 @@ GeoStatus geo_project_build_octree(
             out_summary->elapsed_seconds = stats.elapsed_seconds;
         }
 
+        GEO_LOG_INFO(
+            "八叉树构建完成: 槽位=" + std::to_string(surface_slot) +
+            ", 节点总数=" + std::to_string(stats.total_nodes));
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {
@@ -508,6 +676,9 @@ GeoStatus geo_project_build_tin(
             out_summary->elapsed_seconds = stats.elapsed_seconds;
         }
 
+        GEO_LOG_INFO(
+            "三角网构建完成: 槽位=" + std::to_string(surface_slot) +
+            ", 三角形数=" + std::to_string(stats.tin_triangles));
         ClearLastError();
         return GEO_STATUS_OK;
     } catch (...) {

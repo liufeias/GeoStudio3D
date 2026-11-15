@@ -144,12 +144,12 @@ struct TinSpatialTile {
  * @brief 三维射线拾取结果结构体（用于交互式选择三角网顶点、边或面片）
  */
 struct RayHitResult {
-    bool hit = false;                                   ///< 是否命中有效三角形
-    uint32_t triangle_id = UINT32_MAX;                  ///< 命中的三角形全局索引
-    uint32_t nearest_vertex_id = UINT32_MAX;            ///< 距离交点最近的三角形顶点索引
-    int nearest_edge_slot = -1;                         ///< 距离交点最近的边槽位 [0..2]
-    double distance = std::numeric_limits<double>::max(); ///< 射线原点到交点的欧氏距离（米）
-    Vec3d hit_point{0.0, 0.0, 0.0};                     ///< 交点在 RTC 局部坐标系下的三维坐标
+    bool hit = false;                                       ///< 是否命中有效三角形
+    uint32_t triangle_id = UINT32_MAX;                      ///< 命中的三角形全局索引
+    uint32_t nearest_vertex_id = UINT32_MAX;                ///< 距离交点最近的三角形顶点索引
+    int nearest_edge_slot = -1;                             ///< 距离交点最近的边槽位 [0..2]
+    double distance = (std::numeric_limits<double>::max)(); ///< 射线原点到交点的欧氏距离（米）
+    Vec3d hit_point{0.0, 0.0, 0.0};                         ///< 交点在 RTC 局部坐标系下的三维坐标
 };
 
 /**

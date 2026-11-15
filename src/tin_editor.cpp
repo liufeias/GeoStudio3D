@@ -243,6 +243,7 @@ OperationResult TinTopologyEditor::FlipEdge(
     }
 
     if (!force_flip && t_a.IsEdgeConstrained(edge_slot)) {
+        GEO_LOG_WARN("拒绝翻转已锁定的特征线约束边: tri=" + std::to_string(tri_id));
         return OperationResult::Fail(
             StatusCode::kTopologyDegeneracy,
             "目标边为已锁定的特征线/断裂线约束边，禁止普通边翻转");
@@ -264,7 +265,6 @@ OperationResult TinTopologyEditor::FlipEdge(
     const Vec3d& p_opp_b = surface_.vertices_[opp_b].Position();
     const Vec3d& p_s1 = surface_.vertices_[s1].Position();
 
-    // 严格凸性检验：四边形 (opp_a -> s0 -> opp_b -> s1) 的两条新对角线内角必须严格小于 180 度
     if (ExactPredicates::Orient2D(p_opp_a, p_s0, p_opp_b) <= 0.0 ||
         ExactPredicates::Orient2D(p_opp_b, p_s1, p_opp_a) <= 0.0) {
         return OperationResult::Fail(
@@ -340,6 +340,7 @@ OperationResult TinTopologyEditor::FlipEdge(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("对角线边翻转完成: tri=" + std::to_string(tri_id) + ", adj=" + std::to_string(adj_id));
     return OperationResult::Ok();
 }
 
@@ -353,6 +354,8 @@ OperationResult TinTopologyEditor::ModifyVertexElevation(uint32_t vertex_id, dou
     if (!std::isfinite(new_local_z)) {
         return OperationResult::Fail(StatusCode::kInvalidArgument, "目标高程数值非法 (NaN/Inf)");
     }
+
+    const double old_z = surface_.vertices_[vertex_id].z;
 
     TransactionRecorder recorder(surface_, "修改顶点高程");
     recorder.RecordVertexBefore(vertex_id);
@@ -373,6 +376,10 @@ OperationResult TinTopologyEditor::ModifyVertexElevation(uint32_t vertex_id, dou
 
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO(
+        "修改顶点高程完成: vid=" + std::to_string(vertex_id) +
+        ", old_z=" + std::to_string(old_z) +
+        ", new_z=" + std::to_string(new_local_z));
     return OperationResult::Ok();
 }
 
@@ -699,6 +706,7 @@ OperationResult TinTopologyEditor::InsertVertex(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("插入三角网顶点完成: vid=" + std::to_string(vid));
     return OperationResult::Ok();
 }
 
@@ -1188,6 +1196,7 @@ OperationResult TinTopologyEditor::InsertBreakline(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("强制特征线嵌入完成: 节点数=" + std::to_string(node_vids.size()));
     return OperationResult::Ok();
 }
 
@@ -1272,6 +1281,7 @@ OperationResult TinTopologyEditor::DeleteVertex(uint32_t vertex_id) {
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("删除三角网顶点完成: vid=" + std::to_string(vertex_id));
     return OperationResult::Ok();
 }
 
@@ -1332,6 +1342,7 @@ OperationResult TinTopologyEditor::ClipByPolygon(
         }
     }
 
+    size_t clipped_tri_count = 0;
     for (uint32_t tid = 0; tid < surface_.triangles_.size(); ++tid) {
         TinTriangle& t = surface_.triangles_[tid];
         if (!t.is_active) continue;
@@ -1348,6 +1359,7 @@ OperationResult TinTopologyEditor::ClipByPolygon(
         if (should_remove) {
             recorder.RecordTriangleBefore(tid);
             t.is_active = 0;
+            ++clipped_tri_count;
             for (int e = 0; e < 3; ++e) {
                 const uint32_t nb = t.adj[e];
                 if (nb != UINT32_MAX && surface_.triangles_[nb].is_active) {
@@ -1364,6 +1376,7 @@ OperationResult TinTopologyEditor::ClipByPolygon(
     TinEditTransaction tx = recorder.Finalize();
     surface_.RebuildSpatialTilesAfterEdit(BoundingBox3d{});
     PushTransaction(std::move(tx));
+    GEO_LOG_INFO("多边形边界裁剪完成: 剔除三角形数=" + std::to_string(clipped_tri_count));
     return OperationResult::Ok();
 }
 
@@ -1392,6 +1405,7 @@ OperationResult TinTopologyEditor::Undo() {
 
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     redo_stack_.push_back(std::move(tx));
+    GEO_LOG_INFO("撤销三角网编辑操作成功");
     return OperationResult::Ok();
 }
 
@@ -1418,6 +1432,7 @@ OperationResult TinTopologyEditor::Redo() {
 
     surface_.RebuildSpatialTilesAfterEdit(tx.affected_bounds);
     undo_stack_.push_back(std::move(tx));
+    GEO_LOG_INFO("重做三角网编辑操作成功");
     return OperationResult::Ok();
 }
 

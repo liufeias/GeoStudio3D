@@ -1,9 +1,13 @@
 //! GeoStudio 3D Tauri v2 桌面端后端宿主入口
 //!
-//! 健壮性改进：
-//!   - 在 Windows 桌面 GUI 子系统 (`windows_subsystem = "windows"`) 下，双击运行时若发生
-//!     初始化异常（如缺少动态库或 WebView2 运行时异常），通过原生系统模态对话框 (`MessageBoxW`)
-//!     明确弹出中文诊断提示，彻底杜绝无控制台下的静默闪退。
+//! 健壮性与诊断设计：
+//!   1. Windows UCRT 宽窄流模式断言彻底防护（修复 corecrt_internal_stdio.h:495 崩溃）：
+//!      - 启动第一时间将有效的标准流描述符强制锁定为 `_O_TEXT`（字节透传模式），绝不设置
+//!        `_O_U8TEXT` / `_O_U16TEXT`；
+//!      - 所有控制台中文日志均通过 Win32 原生 `WriteConsoleW` / `WriteFile` 输出，文件日志均以
+//!        二进制字节追加模式写入 `logs/geostudio3d.log`，100% 绕开 UCRT `FILE*` 宽窄字符断言；
+//!      - 统一接管 C++20 几何内核的 `geo_set_log_callback` 回调，前后端日志汇聚至同一文件与终端。
+//!   2. 启动失败原生弹窗兜底：无控制台窗口模式下双击运行时若发生异常，弹出模态错误对话框。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -15,19 +19,248 @@ use kernel_ffi::{
     SafeGeoProject,
 };
 use serde::{Deserialize, Serialize};
+use std::ffi::CStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::http::{header::CONTENT_TYPE, Response, StatusCode};
 use tauri::State;
 
+// ==============================================================================
+// 1. 跨平台企业级双通道 UTF-8 日志系统（绕过 UCRT FILE* 宽窄字符断言）
+// ==============================================================================
+
+static GLOBAL_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+
+/// Windows 启动期标准流与 UTF-8 控制台初始化守卫
+#[cfg(target_os = "windows")]
+fn init_windows_stdio_safety() {
+    const _O_TEXT: c_int = 0x4000;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+    const CP_UTF8: u32 = 65001;
+
+    extern "C" {
+        fn __acrt_iob_func(ix: u32) -> *mut c_void;
+        fn _fileno(stream: *mut c_void) -> c_int;
+        fn _get_osfhandle(fd: c_int) -> isize;
+        fn _setmode(fd: c_int, mode: c_int) -> c_int;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+        fn SetConsoleCP(wCodePageID: u32) -> i32;
+        fn GetStdHandle(nStdHandle: u32) -> isize;
+    }
+
+    unsafe {
+        // 设置控制台代码页为 UTF-8，确保中文字符正常显示
+        let _ = SetConsoleOutputCP(CP_UTF8);
+        let _ = SetConsoleCP(CP_UTF8);
+
+        // 仅当标准输出/标准错误拥有有效操作系统句柄时，将其锁定为 _O_TEXT（防止 ucrtbased.dll 断言）
+        for (idx, std_id) in [(1u32, STD_OUTPUT_HANDLE), (2u32, STD_ERROR_HANDLE)] {
+            let h = GetStdHandle(std_id);
+            if h != 0 && h != -1 {
+                let stream = __acrt_iob_func(idx);
+                if !stream.is_null() {
+                    let fd = _fileno(stream);
+                    if fd >= 0 {
+                        let osf = _get_osfhandle(fd);
+                        if osf != 0 && osf != -1 {
+                            let _ = _setmode(fd, _O_TEXT);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn init_windows_stdio_safety() {}
+
+/// 格式化当前 UTC/本地时间戳字符串 `YYYY-MM-DD HH:MM:SS.mmm`
+fn format_timestamp_now() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = now.as_secs();
+    let millis = now.subsec_millis();
+
+    let days = (total_secs / 86400) as i64;
+    let day_secs = total_secs % 86400;
+    let hour = day_secs / 3600;
+    let minute = (day_secs % 3600) / 60;
+    let second = day_secs % 60;
+
+    // Howard Hinnant 民用历法转换算法（无外部时间库依赖）
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        year, m, d, hour, minute, second, millis
+    )
+}
+
+/// 通过 Win32 原生 API 输出 UTF-8 文本到标准输出/标准错误（完全绕过 UCRT FILE* 断言）
+fn write_console_utf8(line: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(nStdHandle: u32) -> isize;
+            fn GetConsoleMode(hConsoleHandle: isize, lpMode: *mut u32) -> i32;
+            fn WriteConsoleW(
+                hConsoleOutput: isize,
+                lpBuffer: *const u16,
+                nNumberOfCharsToWrite: u32,
+                lpNumberOfCharsWritten: *mut u32,
+                lpReserved: *mut c_void,
+            ) -> i32;
+            fn WriteFile(
+                hFile: isize,
+                lpBuffer: *const u8,
+                nNumberOfBytesToWrite: u32,
+                lpNumberOfBytesWritten: *mut u32,
+                lpOverlapped: *mut c_void,
+            ) -> i32;
+        }
+
+        unsafe {
+            let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+            if h_out != 0 && h_out != -1 {
+                let mut mode: u32 = 0;
+                if GetConsoleMode(h_out, &mut mode) != 0 {
+                    let wide: Vec<u16> = OsStr::new(line).encode_wide().collect();
+                    let mut written: u32 = 0;
+                    let _ = WriteConsoleW(
+                        h_out,
+                        wide.as_ptr(),
+                        wide.len() as u32,
+                        &mut written,
+                        ptr::null_mut(),
+                    );
+                } else {
+                    let bytes = line.as_bytes();
+                    let mut written: u32 = 0;
+                    let _ = WriteFile(
+                        h_out,
+                        bytes.as_ptr(),
+                        bytes.len() as u32,
+                        &mut written,
+                        ptr::null_mut(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::io::stdout().write_all(line.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
+}
+
+fn init_app_logger() {
+    init_windows_stdio_safety();
+
+    let log_file = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("logs")))
+        .and_then(|log_dir| {
+            let _ = fs::create_dir_all(&log_dir);
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("geostudio3d.log"))
+                .ok()
+        });
+
+    let _ = GLOBAL_LOG_FILE.set(Mutex::new(log_file));
+}
+
+fn app_log(level: &str, module: &str, msg: &str) {
+    let ts = format_timestamp_now();
+    let tid = std::thread::current().id();
+    let formatted = format!("[{}] [{:<5}] [{:?}] [{}] {}\n", ts, level, tid, module, msg);
+
+    write_console_utf8(&formatted);
+
+    if let Some(lock) = GLOBAL_LOG_FILE.get() {
+        if let Ok(mut guard) = lock.lock() {
+            if let Some(ref mut file) = *guard {
+                let _ = file.write_all(formatted.as_bytes());
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
+/// C++20 几何内核日志回调桥接函数
+extern "C" fn cpp_kernel_log_bridge(
+    level: i32,
+    module_name: *const c_char,
+    source_location: *const c_char,
+    message: *const c_char,
+    _user_data: *mut c_void,
+) {
+    let level_str = match level {
+        0 => "DEBUG",
+        1 => "INFO",
+        2 => "WARN",
+        _ => "ERROR",
+    };
+    let mod_str = if module_name.is_null() {
+        "CPP"
+    } else {
+        unsafe { CStr::from_ptr(module_name).to_str().unwrap_or("CPP") }
+    };
+    let loc_str = if source_location.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(source_location).to_str().unwrap_or("") }
+    };
+    let msg_str = if message.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(message).to_str().unwrap_or("") }
+    };
+
+    let full_msg = if loc_str.is_empty() {
+        msg_str.to_string()
+    } else {
+        format!("({}) {}", loc_str, msg_str)
+    };
+    app_log(level_str, mod_str, &full_msg);
+}
+
 /// 跨平台原生启动错误提示弹窗（确保双击启动失败时用户可见明确诊断原因）
 fn show_native_fatal_dialog(title: &str, message: &str) {
-    eprintln!("[{}] {}", title, message);
+    app_log("ERROR", "FATAL", &format!("{}: {}", title, message));
 
     #[cfg(target_os = "windows")]
     {
         use std::ffi::OsStr;
-        use std::os::raw::c_void;
         use std::os::windows::ffi::OsStrExt;
 
         #[link(name = "user32")]
@@ -85,6 +318,10 @@ fn show_native_fatal_dialog(title: &str, message: &str) {
     }
 }
 
+// ==============================================================================
+// 2. Tauri 应用状态与数据传输对象 (DTO)
+// ==============================================================================
+
 struct AppKernelState {
     project: Arc<SafeGeoProject>,
 }
@@ -124,7 +361,7 @@ struct GradingSummaryDto {
 }
 
 // ==============================================================================
-// Tauri 异步业务命令集
+// 3. Tauri 异步业务命令集
 // ==============================================================================
 
 #[tauri::command]
@@ -134,6 +371,7 @@ async fn cmd_load_dat(
     file_path: String,
     coord_order: i32,
 ) -> Result<GeoDatSummary, String> {
+    app_log("INFO", "IPC", &format!("请求导入点云: slot={}, path={}", slot, file_path));
     let proj = Arc::clone(&state.project);
     tauri::async_runtime::spawn_blocking(move || proj.load_dat(slot, &file_path, coord_order))
         .await
@@ -559,17 +797,38 @@ async fn cmd_compute_slope_grading(
 }
 
 // ==============================================================================
-// Tauri 主应用启动入口（带异常保护与原生错误提示弹窗）
+// 4. Tauri 主应用启动入口（带异常保护与原生错误提示弹窗）
 // ==============================================================================
 
 fn try_run_app() -> Result<(), String> {
-    let kernel_lib = Arc::new(GeoKernelLib::load_auto()?);
+    let mode_label = if cfg!(debug_assertions) {
+        "DEBUG 模式"
+    } else {
+        "RELEASE 模式"
+    };
+    app_log(
+        "INFO",
+        "BOOT",
+        &format!("=== GeoStudio 3D ({}) 启动初始化 ===", mode_label),
+    );
+
+    let kernel_lib = Arc::new(GeoKernelLib::load_auto(|msg| {
+        app_log("INFO", "FFI", msg);
+    })?);
+    kernel_lib.set_log_callback(Some(cpp_kernel_log_bridge));
+
     let project = Arc::new(SafeGeoProject::new(kernel_lib)?);
     let protocol_project = Arc::clone(&project);
+
+    app_log("INFO", "TAURI", "正在初始化 Tauri v2 桌面窗口与 WebView2 渲染引擎...");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppKernelState { project })
+        .setup(|_app| {
+            app_log("INFO", "TAURI", "主窗口与自定义协议 geotile:// 就绪");
+            Ok(())
+        })
         .register_uri_scheme_protocol("geotile", move |_ctx, request| {
             let uri = request.uri();
             let path = uri.path();
@@ -642,6 +901,7 @@ fn try_run_app() -> Result<(), String> {
 }
 
 fn main() {
+    init_app_logger();
     if let Err(err_msg) = try_run_app() {
         show_native_fatal_dialog("GeoStudio 3D 启动错误", &err_msg);
         std::process::exit(1);
