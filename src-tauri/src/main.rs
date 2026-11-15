@@ -1,14 +1,9 @@
 //! GeoStudio 3D Tauri v2 桌面端后端宿主入口
 //!
-//! 架构亮点：
-//!   1. 自定义零拷贝二进制流协议 `geotile://`：
-//!      前端 `fetch("http://geotile.localhost/octree/{slot}/{node_id}")` 与
-//!      `fetch("http://geotile.localhost/tin/{slot}/{tile_index}?clear=1")` 请求直接命中
-//!      Rust 异步协议处理器，调用 C++ 内核导出原始 96B 包头 + 顶点/索引字节数组，
-//!      以 `application/octet-stream` 毫秒级直推浏览器显存，彻底消除 Base64/JSON 序列化开销。
-//!   2. 异步阻塞线程池卸载（`tauri::async_runtime::spawn_blocking`）：
-//!      所有耗时操作（亿级 `.dat` 解析、八叉树重排、三角网剖分、三棱柱土方算量、多级放坡）
-//!      全部卸载至后台工作线程池执行，主 UI 线程保持 60FPS 绝对流畅响应。
+//! 健壮性改进：
+//!   - 在 Windows 桌面 GUI 子系统 (`windows_subsystem = "windows"`) 下，双击运行时若发生
+//!     初始化异常（如缺少动态库或 WebView2 运行时异常），通过原生系统模态对话框 (`MessageBoxW`)
+//!     明确弹出中文诊断提示，彻底杜绝无控制台下的静默闪退。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -24,6 +19,71 @@ use std::ptr;
 use std::sync::Arc;
 use tauri::http::{header::CONTENT_TYPE, Response, StatusCode};
 use tauri::State;
+
+/// 跨平台原生启动错误提示弹窗（确保双击启动失败时用户可见明确诊断原因）
+fn show_native_fatal_dialog(title: &str, message: &str) {
+    eprintln!("[{}] {}", title, message);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::raw::c_void;
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(
+                hwnd: *mut c_void,
+                text: *const u16,
+                caption: *const u16,
+                utype: u32,
+            ) -> i32;
+        }
+
+        let wide_msg: Vec<u16> = OsStr::new(message)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let wide_title: Vec<u16> = OsStr::new(title)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // MB_OK (0x0) | MB_ICONERROR (0x10) | MB_SYSTEMMODAL (0x1000)
+        unsafe {
+            MessageBoxW(
+                ptr::null_mut(),
+                wide_msg.as_ptr(),
+                wide_title.as_ptr(),
+                0x0000_1010,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let escaped = message.replace('"', "\\\"");
+        let script = format!(
+            "display dialog \"{}\" with title \"{}\" buttons {{\"确定\"}} default button \"确定\" with icon stop",
+            escaped, title
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status();
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("zenity")
+            .args(["--error", "--title", title, "--text", message])
+            .status()
+            .or_else(|_| {
+                std::process::Command::new("kdialog")
+                    .args(["--error", message, "--title", title])
+                    .status()
+            });
+    }
+}
 
 struct AppKernelState {
     project: Arc<SafeGeoProject>,
@@ -499,26 +559,18 @@ async fn cmd_compute_slope_grading(
 }
 
 // ==============================================================================
-// Tauri 主应用构建与 geotile:// 零拷贝二进制瓦片协议注册
+// Tauri 主应用启动入口（带异常保护与原生错误提示弹窗）
 // ==============================================================================
 
-fn main() {
-    let kernel_lib = Arc::new(
-        GeoKernelLib::load_auto().expect("启动失败：未能加载 C++20 空间几何内核动态库 GeoKernelCore"),
-    );
-    let project = Arc::new(
-        SafeGeoProject::new(kernel_lib).expect("启动失败：无法创建几何内核工程会话实例"),
-    );
-
+fn try_run_app() -> Result<(), String> {
+    let kernel_lib = Arc::new(GeoKernelLib::load_auto()?);
+    let project = Arc::new(SafeGeoProject::new(kernel_lib)?);
     let protocol_project = Arc::clone(&project);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppKernelState { project })
         .register_uri_scheme_protocol("geotile", move |_ctx, request| {
-            // 解析路径格式：
-            //   /octree/{slot}/{node_id}
-            //   /tin/{slot}/{tile_index}?clear=1
             let uri = request.uri();
             let path = uri.path();
             let query = uri.query().unwrap_or("");
@@ -528,7 +580,9 @@ fn main() {
             let result: Result<Vec<u8>, String> = match segments.as_slice() {
                 ["octree", slot_str, node_str] => {
                     let slot = slot_str.parse::<i32>().map_err(|_| "非法槽位编号".to_string());
-                    let node_id = node_str.parse::<u32>().map_err(|_| "非法八叉树节点编号".to_string());
+                    let node_id = node_str
+                        .parse::<u32>()
+                        .map_err(|_| "非法八叉树节点编号".to_string());
                     match (slot, node_id) {
                         (Ok(s), Ok(nid)) => protocol_project.fetch_octree_packet(s, nid),
                         (Err(e), _) | (_, Err(e)) => Err(e),
@@ -536,7 +590,9 @@ fn main() {
                 }
                 ["tin", slot_str, tile_str] => {
                     let slot = slot_str.parse::<i32>().map_err(|_| "非法槽位编号".to_string());
-                    let tile_idx = tile_str.parse::<u32>().map_err(|_| "非法三角网瓦片编号".to_string());
+                    let tile_idx = tile_str
+                        .parse::<u32>()
+                        .map_err(|_| "非法三角网瓦片编号".to_string());
                     match (slot, tile_idx) {
                         (Ok(s), Ok(tidx)) => {
                             protocol_project.fetch_tin_tile_packet(s, tidx, clear_dirty)
@@ -582,6 +638,13 @@ fn main() {
             cmd_compute_slope_grading,
         ])
         .run(tauri::generate_context!())
-        .expect("运行 GeoStudio 3D 桌面端应用时发生致命错误");
+        .map_err(|e| format!("Tauri 桌面窗口引擎启动失败: {}", e))
+}
+
+fn main() {
+    if let Err(err_msg) = try_run_app() {
+        show_native_fatal_dialog("GeoStudio 3D 启动错误", &err_msg);
+        std::process::exit(1);
+    }
 }
 

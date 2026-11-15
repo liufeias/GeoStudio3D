@@ -1,16 +1,17 @@
 //! 空间几何内核 `GeoKernelCore` 动态库 FFI 安全封装层
 //!
-//! 设计要点：
+//! 设计规范：
 //!   1. 所有 `#[repr(C)]` 结构体与 `include/geo_kernel/geo_kernel_c_api.h` 严格逐字节对齐；
-//!   2. 通过 `libloading` 运行时动态加载 `GeoKernelCore.dll` / `libGeoKernelCore.so` / `libGeoKernelCore.dylib`，
-//!      支持自动探测可执行文件同级目录及构建输出目录，部署零配置；
-//!   3. 暴露线程安全的 `SafeGeoProject` 句柄包装，析构时自动调用 `geo_project_destroy` 释放全部 C++ 内存。
+//!   2. 严格路径加载策略：仅从当前桌面主程序（`geo-studio-3d.exe`）所在同级目录加载
+//!      `GeoKernelCore.dll`（Linux 为 `libGeoKernelCore.so`，macOS 为 `libGeoKernelCore.dylib`），
+//!      禁止跨目录猜测或回退搜索系统环境变量路径，杜绝加载错误版本动态库的风险；
+//!   3. 若同级目录下不存在核心动态库或加载失败，返回包含精确期望路径与系统错误码的中文诊断信息；
+//!   4. 暴露线程安全的 `SafeGeoProject` 句柄包装，析构时自动调用 `geo_project_destroy` 释放全部 C++ 内存。
 
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
-use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 
@@ -302,7 +303,7 @@ pub struct GeoKernelLib {
 }
 
 impl GeoKernelLib {
-    /// 自动从多个候选路径加载 `GeoKernelCore` 动态链接库
+    /// 严格从当前可执行文件所在同级目录加载 `GeoKernelCore` 动态链接库（禁止跨目录猜测）
     pub fn load_auto() -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         let lib_name = "GeoKernelCore.dll";
@@ -311,29 +312,33 @@ impl GeoKernelLib {
         #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         let lib_name = "libGeoKernelCore.so";
 
-        let mut candidates: Vec<PathBuf> = vec![PathBuf::from(lib_name)];
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                candidates.push(exe_dir.join(lib_name));
-                candidates.push(exe_dir.join("../lib").join(lib_name));
-                candidates.push(exe_dir.join("../../build/lib").join(lib_name));
-                candidates.push(exe_dir.join("../../build/bin/Release").join(lib_name));
-            }
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("无法获取当前主程序可执行文件路径: {}", e))?;
+        let exe_dir = exe_path
+            .parent()
+            .ok_or_else(|| "无法解析当前主程序所在父目录".to_string())?;
+
+        // 唯一合法加载路径：与主程序严格位于同一目录下的动态链接库
+        let exact_dll_path = exe_dir.join(lib_name);
+
+        if !exact_dll_path.is_file() {
+            return Err(format!(
+                "同级目录下缺少核心几何内核动态库 {}。\n期望精确路径: {}\n请确保 {} 与主程序放在同一文件夹内。",
+                lib_name,
+                exact_dll_path.display(),
+                lib_name
+            ));
         }
 
-        let mut last_err = String::new();
-        for cand in candidates {
-            if let Ok(lib) = unsafe { Library::new(&cand) } {
-                return unsafe { Self::bind_symbols(lib) };
-            } else if let Err(e) = unsafe { Library::new(&cand) } {
-                last_err = format!("尝试加载 {:?} 失败: {}", cand, e);
-            }
-        }
+        let lib = unsafe { Library::new(&exact_dll_path) }.map_err(|err| {
+            format!(
+                "加载同级目录核心动态库失败。\n目标路径: {}\n系统错误详情: {}",
+                exact_dll_path.display(),
+                err
+            )
+        })?;
 
-        Err(format!(
-            "未能找到或加载几何内核动态库 {} ({})",
-            lib_name, last_err
-        ))
+        unsafe { Self::bind_symbols(lib) }
     }
 
     unsafe fn bind_symbols(lib: Library) -> Result<Self, String> {
@@ -456,7 +461,7 @@ impl GeoKernelLib {
     }
 }
 
-/// 线程安全的工程句柄 RAII 包装器（C++ 内核内部已使用 std::shared_mutex 保护并发访问）
+/// 线程安全的工程句柄 RAII 包装器
 pub struct SafeGeoProject {
     pub lib: Arc<GeoKernelLib>,
     pub handle: GeoProjectHandle,

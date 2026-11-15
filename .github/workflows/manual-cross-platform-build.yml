@@ -5,11 +5,15 @@
 # 核心设计规范：
 #   1. 严格手动触发（仅 workflow_dispatch）：在 Actions 页面点击 "Run workflow" 启动。
 #   2. 可视化自由勾选构建平台：支持 Windows、Linux、macOS、WebAssembly (WASM) 任意组合。
-#   3. 全链路增量构建缓存（C++20 build/ + npm node_modules/ + Rust target/）：
-#      - 采用 restore + if: always() save 双阶段策略，即使某步构建失败也会保存已编译依赖，
-#        二次重跑无需重复下载和编译数百个 Rust/C++ 依赖单元，大幅缩短排查迭代周期。
-#   4. 严格项目路径校验与全阶段日志采集：
-#      - 无论构建成功或失败（if: always()）均强制上传完整诊断日志与 CMake 内部日志包。
+#   3. 全链路原生 Node 24 Actions (checkout@v5 / setup-node@v5 / cache@v5 / upload-artifact@v6)
+#      + 原生 vswhere/vcvars64 批处理激活，零 Node.js 20 弃用警告且无引号转义故障。
+#   4. 规范化输出三大独立 ZIP 产物包 + 强制诊断日志包：
+#      - 产物 1（源码包）：`GeoStudio3D-source.zip`（完整纯净项目源码，不含临时编译目录）
+#      - 产物 2（可执行程序包）：`GeoStudio3D-<平台>-executable.zip`（仅含同目录主程序、
+#        核心动态库、压测工具与安装包，严禁混入头文件、.lib 导入库或重复 resources/ 目录）
+#      - 产物 3（二次开发导入库 SDK 包）：`GeoStudio3D-<平台>-sdk.zip`（含 include/ 头文件、
+#        lib/GeoKernelCore.lib 导入库、bin/GeoKernelCore.dll 动态库及 CMake 集成配置）
+#      - 诊断日志包（if: always()）：无论构建成功或失败均强制上传全阶段详细日志。
 # ==============================================================================
 
 name: Manual Cross-Platform Build & Diagnostics
@@ -38,7 +42,7 @@ on:
         required: true
         default: false
       build_scope:
-        description: "构建范围（full-app: C++内核+前端+Tauri桌面应用 | kernel-only: 仅C++20内核与压测）"
+        description: "构建范围（full-app: C++内核+前端+Tauri桌面应用 | kernel-only: 仅C++20内核与SDK）"
         type: choice
         required: true
         default: "full-app"
@@ -73,13 +77,15 @@ env:
   CARGO_TERM_VERBOSE: "true"
   RUST_BACKTRACE: "full"
   FORCE_COLOR: "1"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
 
 jobs:
   # ============================================================================
-  # 阶段 0：严格路径完整性校验与动态多平台构建矩阵生成
+  # 阶段 0：严格路径完整性校验、生成完整源码 ZIP 包（第 1 个 ZIP 产物）与动态构建矩阵
   # ============================================================================
   prepare-build:
-    name: "0. 校验构建参数、项目路径与生成矩阵"
+    name: "0. 校验项目路径、打包完整源码 ZIP 与生成矩阵"
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
@@ -92,11 +98,11 @@ jobs:
 
     steps:
       - name: "检出仓库源码"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
-      - name: "严格校验勾选平台与项目标准文件路径"
+      - name: "严格校验勾选平台、项目标准路径并生成完整源码 ZIP"
         id: calc-matrix
         shell: bash
         env:
@@ -127,7 +133,10 @@ jobs:
           fi
 
           python3 - <<'PY'
-          import json, os
+          import hashlib, json, os, sys, zipfile
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(encoding="utf-8")
 
           required_paths = [
               "CMakeLists.txt",
@@ -186,6 +195,39 @@ jobs:
 
           print(f"[严格路径校验通过] 全部 {len(required_paths)} 个项目文件均位于标准路径下。")
 
+          # --------------------------------------------------------------------
+          # 生成产物 1：完整纯净源码压缩包 release-zips/GeoStudio3D-source.zip
+          # --------------------------------------------------------------------
+          os.makedirs("release-zips", exist_ok=True)
+          source_zip_path = "release-zips/GeoStudio3D-source.zip"
+          exclude_dirs = {
+              ".git", "build", "build-wasm", "build-logs", "dist-kernel",
+              "release-staging", "release-zips", "node_modules", "dist", "target"
+          }
+
+          file_count = 0
+          sha_lines = []
+          with zipfile.ZipFile(source_zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = sorted([d for d in dirs if d not in exclude_dirs])
+                  for fn in sorted(files):
+                      full_path = os.path.join(root, fn)
+                      rel_path = os.path.relpath(full_path, ".").replace("\\", "/")
+                      arc_name = f"GeoStudio3D-source/{rel_path}"
+                      zf.write(full_path, arc_name)
+                      h = hashlib.sha256()
+                      with open(full_path, "rb") as f:
+                          while True:
+                              chunk = f.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              h.update(chunk)
+                      sha_lines.append(f"{h.hexdigest()}  {rel_path}")
+                      file_count += 1
+              zf.writestr("GeoStudio3D-source/SHA256SUMS.txt", "\n".join(sha_lines) + "\n")
+
+          print(f"[源码打包完成] 已生成 {source_zip_path} (共包含 {file_count} 个源码文件)")
+
           targets = []
           if os.environ.get("IN_WIN") == "true":
               targets.append({
@@ -193,7 +235,10 @@ jobs:
                   "platform_label": "Windows x86_64",
                   "os": "windows-2022",
                   "shared_lib": "GeoKernelCore.dll",
+                  "import_lib": "GeoKernelCore.lib",
+                  "export_exp": "GeoKernelCore.exp",
                   "bench_exe": "GeoKernelBench.exe",
+                  "app_exe": "geo-studio-3d.exe",
                   "cmake_generator": "Ninja"
               })
           if os.environ.get("IN_LINUX") == "true":
@@ -202,7 +247,10 @@ jobs:
                   "platform_label": "Linux x86_64",
                   "os": "ubuntu-22.04",
                   "shared_lib": "libGeoKernelCore.so",
+                  "import_lib": "libGeoKernelCore.so",
+                  "export_exp": "",
                   "bench_exe": "GeoKernelBench",
+                  "app_exe": "geo-studio-3d",
                   "cmake_generator": "Ninja"
               })
           if os.environ.get("IN_MACOS") == "true":
@@ -211,7 +259,10 @@ jobs:
                   "platform_label": "macOS Apple Silicon",
                   "os": "macos-latest",
                   "shared_lib": "libGeoKernelCore.dylib",
+                  "import_lib": "libGeoKernelCore.dylib",
+                  "export_exp": "",
                   "bench_exe": "GeoKernelBench",
+                  "app_exe": "geo-studio-3d",
                   "cmake_generator": "Ninja"
               })
 
@@ -225,8 +276,17 @@ jobs:
           print(f"[信息] 已生成原生平台构建矩阵 ({len(targets)} 个目标): {matrix_payload}")
           PY
 
+      - name: "上传产物 1：完整源码压缩包 (GeoStudio3D-source.zip)"
+        uses: actions/upload-artifact@v6
+        with:
+          name: "GeoStudio3D-source-run${{ github.run_number }}"
+          path: "release-zips/GeoStudio3D-source.zip"
+          compression-level: 0
+          retention-days: 30
+
   # ============================================================================
   # 阶段 1：原生桌面多平台并行构建（Windows / Linux / macOS）
+  # 生成产物 2（纯净可执行程序 ZIP）与产物 3（二次开发导入库 SDK ZIP）
   # ============================================================================
   build-native-platforms:
     name: "构建 [${{ matrix.platform_label }}]"
@@ -241,7 +301,10 @@ jobs:
     env:
       PLATFORM_ID: ${{ matrix.platform_id }}
       SHARED_LIB_NAME: ${{ matrix.shared_lib }}
+      IMPORT_LIB_NAME: ${{ matrix.import_lib }}
+      EXPORT_EXP_NAME: ${{ matrix.export_exp }}
       BENCH_EXE_NAME: ${{ matrix.bench_exe }}
+      APP_EXE_NAME: ${{ matrix.app_exe }}
       CMAKE_GEN: ${{ matrix.cmake_generator }}
       BUILD_TYPE: ${{ needs.prepare-build.outputs.cmake_build_type }}
       BUILD_SCOPE: ${{ needs.prepare-build.outputs.build_scope }}
@@ -250,7 +313,7 @@ jobs:
 
     steps:
       - name: "1. 检出仓库源码"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -283,11 +346,11 @@ jobs:
           echo "00_SYSTEM_ENV=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
       # ------------------------------------------------------------------------
-      # 恢复增量构建缓存（C++ build/ + npm 依赖 + Rust target/ 与 Cargo 仓库）
+      # 恢复增量构建缓存（使用 Node 24 原生 actions/cache@v5）
       # ------------------------------------------------------------------------
       - name: "2B. [Cache] 恢复 C++20 增量编译缓存"
         id: cache-cpp-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: build
           key: "cpp-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.run_id }}"
@@ -298,7 +361,7 @@ jobs:
       - name: "2C. [Cache] 恢复前端 npm 依赖缓存"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
         id: cache-npm-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.npm
@@ -311,7 +374,7 @@ jobs:
       - name: "2D. [Cache] 恢复 Rust Cargo 仓库与 Tauri 编译缓存"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
         id: cache-rust-restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/bin
@@ -325,13 +388,10 @@ jobs:
             rust-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-
             rust-${{ matrix.platform_id }}-
 
-      - name: "3A. [Windows] 激活 MSVC x64 编译环境"
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: "3B. [Windows] 校验 MSVC cl.exe 与 Ninja 工具链"
+      # ------------------------------------------------------------------------
+      # 步骤 3：配置平台原生编译器（Windows 临时批处理激活 vcvars64，零转义问题）
+      # ------------------------------------------------------------------------
+      - name: "3A. [Windows] 原生探测并激活 MSVC x64 编译环境"
         if: runner.os == 'Windows'
         shell: bash
         run: |
@@ -342,7 +402,7 @@ jobs:
             local ec=$?
             if [[ "${ERR_REPORTED}" -eq 0 ]]; then
               ERR_REPORTED=1
-              echo "[致命错误] Windows 工具链校验失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
+              echo "[致命错误] Windows MSVC 环境激活失败 (行号: $1, 退出码: ${ec})" | tee -a "${LOG_FILE}"
               echo "01_TOOLCHAIN_DEPS=FAILED" >> "${STAGE_STATUS_FILE}"
             fi
             exit "${ec}"
@@ -350,17 +410,92 @@ jobs:
           trap 'on_step_err $LINENO' ERR
 
           {
-            echo "==================== 01. Windows MSVC 工具链校验 ===================="
+            echo "==================== 01. Windows MSVC 原生环境激活 ===================="
             echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            which cl
-            cl 2>&1 | head -n 5 || true
-            cmake --version
-            ninja --version
+
+            VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+            if [[ ! -f "${VSWHERE}" ]]; then
+              echo "[严重错误] 未找到 vswhere.exe: ${VSWHERE}"
+              exit 1
+            fi
+
+            VS_DIR=$("${VSWHERE}" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')
+            if [[ -z "${VS_DIR}" ]]; then
+              echo "[严重错误] 未检测到已安装的 MSVC x64 C++ 生成工具"
+              exit 1
+            fi
+            echo "[信息] 定位到 Visual Studio 安装目录: ${VS_DIR}"
+
+            export VS_INSTALL_DIR="${VS_DIR}"
+            python3 - <<'PY'
+          import os, subprocess, sys, tempfile
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(encoding="utf-8")
+
+          vs_dir = os.environ["VS_INSTALL_DIR"]
+          vcvars = os.path.join(vs_dir, "VC", "Auxiliary", "Build", "vcvars64.bat")
+          if not os.path.isfile(vcvars):
+              raise RuntimeError(f"未找到 vcvars64.bat: {vcvars}")
+
+          # 写入临时批处理文件再调用 cmd.exe /d /c，彻底规避 CreateProcess 双引号转义问题
+          bat_script = (
+              "@echo off\r\n"
+              f'call "{vcvars}" >nul\r\n'
+              "if errorlevel 1 exit /b %errorlevel%\r\n"
+              "set\r\n"
+          )
+
+          with tempfile.NamedTemporaryFile(
+              mode="w", suffix=".bat", encoding="ascii", newline="", delete=False
+          ) as tf:
+              tf.write(bat_script)
+              bat_path = tf.name
+
+          try:
+              out = subprocess.check_output(
+                  ["cmd.exe", "/d", "/c", bat_path],
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace"
+              )
+          finally:
+              if os.path.exists(bat_path):
+                  os.remove(bat_path)
+
+          new_env = {}
+          for line in out.splitlines():
+              if "=" in line:
+                  k, v = line.split("=", 1)
+                  new_env[k] = v
+
+          new_path = new_env.get("Path") or new_env.get("PATH") or ""
+          old_path_entries = set(os.environ.get("PATH", "").split(os.pathsep))
+          added_paths = [p for p in new_path.split(";") if p and p not in old_path_entries]
+
+          with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as gp:
+              for p in added_paths:
+                  gp.write(p + "\n")
+
+          target_keys = {
+              "INCLUDE", "LIB", "LIBPATH",
+              "VCINSTALLDIR", "VCToolsInstallDir", "VCToolsVersion", "VCToolsRedistDir",
+              "WindowsSdkDir", "WindowsSdkVersion", "WindowsSDKLibVersion",
+              "UniversalCRTSdkDir", "UCRTVersion", "Platform", "CommandPromptType"
+          }
+          upper_targets = {x.upper() for x in target_keys}
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as ge:
+              for k, v in new_env.items():
+                  if k.upper() in upper_targets:
+                      ge.write(f"{k}={v}\n")
+
+          print(f"[成功] 已激活 MSVC x64 编译环境，追加 {len(added_paths)} 条工具链路径。")
+          PY
             echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           } 2>&1 | tee "${LOG_FILE}"
           echo "01_TOOLCHAIN_DEPS=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
-      - name: "3C. [Linux] 安装 C++20 与桌面运行库系统依赖"
+      - name: "3B. [Linux] 安装 C++20 与桌面运行库系统依赖"
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -426,7 +561,7 @@ jobs:
           } 2>&1 | tee "${LOG_FILE}"
           echo "01_TOOLCHAIN_DEPS=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
-      - name: "3D. [macOS] 安装 Ninja 并校验 Apple Clang"
+      - name: "3C. [macOS] 安装 Ninja 并校验 Apple Clang"
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -455,6 +590,9 @@ jobs:
           } 2>&1 | tee "${LOG_FILE}"
           echo "01_TOOLCHAIN_DEPS=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
+      # ------------------------------------------------------------------------
+      # 步骤 4：CMake 配置与编译 C++20 独立空间几何内核，并分类暂存运行库与 SDK 导入库
+      # ------------------------------------------------------------------------
       - name: "4. 编译 C++20 独立空间几何内核 (GeoKernelCore & GeoKernelBench)"
         shell: bash
         run: |
@@ -489,12 +627,15 @@ jobs:
             cmake --build build --config "${BUILD_TYPE}" --parallel
 
             echo "------------------------------------------------------------------"
-            echo "[归集 C++20 几何内核动态库与头文件]"
+            echo "[分类暂存：运行态动态库 (bin) 与二次开发导入库/头文件 (lib + include)]"
+            rm -rf "dist-kernel/${PLATFORM_ID}"
+            mkdir -p "dist-kernel/${PLATFORM_ID}/bin"
+            mkdir -p "dist-kernel/${PLATFORM_ID}/lib"
             mkdir -p "dist-kernel/${PLATFORM_ID}/include/geo_kernel"
+
             cp -r include/geo_kernel/* "dist-kernel/${PLATFORM_ID}/include/geo_kernel/"
 
             LIB_FOUND=$(find build/bin build/lib -type f -name "${SHARED_LIB_NAME}" 2>/dev/null | head -n 1 || true)
-            IMPORT_LIB_FOUND=$(find build/lib -type f -name "GeoKernelCore.lib" 2>/dev/null | head -n 1 || true)
             BENCH_FOUND=$(find build/bin -type f -name "${BENCH_EXE_NAME}" 2>/dev/null | head -n 1 || true)
 
             if [[ -z "${LIB_FOUND}" ]]; then
@@ -503,23 +644,38 @@ jobs:
               exit 1
             fi
 
-            cp "${LIB_FOUND}" "dist-kernel/${PLATFORM_ID}/"
-            echo "[成功] 动态库已归集: ${LIB_FOUND} -> dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}"
-
-            if [[ -n "${IMPORT_LIB_FOUND}" ]]; then
-              cp "${IMPORT_LIB_FOUND}" "dist-kernel/${PLATFORM_ID}/"
-              echo "[成功] Windows 导入库已归集: ${IMPORT_LIB_FOUND} -> dist-kernel/${PLATFORM_ID}/GeoKernelCore.lib"
-            fi
+            cp "${LIB_FOUND}" "dist-kernel/${PLATFORM_ID}/bin/"
+            echo "[成功] 运行态动态库已归集: ${LIB_FOUND} -> dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}"
 
             if [[ -n "${BENCH_FOUND}" ]]; then
-              cp "${BENCH_FOUND}" "dist-kernel/${PLATFORM_ID}/"
-              echo "[成功] 基准程序已归集: ${BENCH_FOUND} -> dist-kernel/${PLATFORM_ID}/${BENCH_EXE_NAME}"
+              cp "${BENCH_FOUND}" "dist-kernel/${PLATFORM_ID}/bin/"
+              echo "[成功] 基准程序已归集: ${BENCH_FOUND} -> dist-kernel/${PLATFORM_ID}/bin/${BENCH_EXE_NAME}"
+            fi
+
+            IMPORT_FOUND=$(find build/lib build/bin -type f -name "${IMPORT_LIB_NAME}" 2>/dev/null | head -n 1 || true)
+            if [[ -z "${IMPORT_FOUND}" ]]; then
+              echo "[严重错误] 未找到二次开发导入库产物: ${IMPORT_LIB_NAME}"
+              find build -maxdepth 4
+              exit 1
+            fi
+            cp "${IMPORT_FOUND}" "dist-kernel/${PLATFORM_ID}/lib/"
+            echo "[成功] 二次开发导入库已归集: ${IMPORT_FOUND} -> dist-kernel/${PLATFORM_ID}/lib/${IMPORT_LIB_NAME}"
+
+            if [[ -n "${EXPORT_EXP_NAME}" ]]; then
+              EXP_FOUND=$(find build/lib -type f -name "${EXPORT_EXP_NAME}" 2>/dev/null | head -n 1 || true)
+              if [[ -n "${EXP_FOUND}" ]]; then
+                cp "${EXP_FOUND}" "dist-kernel/${PLATFORM_ID}/lib/"
+                echo "[成功] Windows 导出符号表文件已归集: ${EXP_FOUND} -> dist-kernel/${PLATFORM_ID}/lib/${EXPORT_EXP_NAME}"
+              fi
             fi
 
             echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           } 2>&1 | tee "${LOG_FILE}"
           echo "02_CPP_KERNEL_BUILD=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
+      # ------------------------------------------------------------------------
+      # 步骤 5：运行 GeoKernelBench 算法精度与性能端到端自检
+      # ------------------------------------------------------------------------
       - name: "5. 运行 GeoKernelBench 算法精度与性能端到端自检"
         if: needs.prepare-build.outputs.run_kernel_benchmark == 'true'
         shell: bash
@@ -542,31 +698,37 @@ jobs:
             echo "==================== 03. GeoKernelBench 端到端自检 ===================="
             echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-            BENCH_BIN="dist-kernel/${PLATFORM_ID}/${BENCH_EXE_NAME}"
+            BENCH_BIN="dist-kernel/${PLATFORM_ID}/bin/${BENCH_EXE_NAME}"
             if [[ ! -f "${BENCH_BIN}" ]]; then
               echo "[严重错误] 未找到可执行基准测试程序: ${BENCH_BIN}"
               exit 1
             fi
 
             chmod +x "${BENCH_BIN}" || true
-            export LD_LIBRARY_PATH="${PWD}/dist-kernel/${PLATFORM_ID}:${LD_LIBRARY_PATH:-}"
-            export DYLD_LIBRARY_PATH="${PWD}/dist-kernel/${PLATFORM_ID}:${DYLD_LIBRARY_PATH:-}"
+            export LD_LIBRARY_PATH="${PWD}/dist-kernel/${PLATFORM_ID}/bin:${LD_LIBRARY_PATH:-}"
+            export DYLD_LIBRARY_PATH="${PWD}/dist-kernel/${PLATFORM_ID}/bin:${DYLD_LIBRARY_PATH:-}"
             "${BENCH_BIN}" --points 500000 --grid 0.5
 
             echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           } 2>&1 | tee "${LOG_FILE}"
           echo "03_KERNEL_SELFTEST=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
-      - name: "6A. [Full-App] 配置 Node.js 20 环境"
+      # ------------------------------------------------------------------------
+      # 步骤 6：安装 Node.js 24 LTS 与 Rust 稳定版工具链（仅 full-app 模式执行）
+      # ------------------------------------------------------------------------
+      - name: "6A. [Full-App] 配置 Node.js 24 LTS 环境"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: "6B. [Full-App] 配置 Rust 稳定版工具链"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
         uses: dtolnay/rust-toolchain@stable
 
+      # ------------------------------------------------------------------------
+      # 步骤 7：构建 TypeScript + Three.js 前端资源
+      # ------------------------------------------------------------------------
       - name: "7. [Full-App] 构建 TypeScript + Three.js 前端工程"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
         shell: bash
@@ -615,6 +777,9 @@ jobs:
           } 2>&1 | tee "${LOG_FILE}"
           echo "04_FRONTEND_BUILD=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
+      # ------------------------------------------------------------------------
+      # 步骤 8：构建 Tauri v2 桌面宿主与原生安装包（单次直编，无重复编译）
+      # ------------------------------------------------------------------------
       - name: "8. [Full-App] 构建 Tauri v2 桌面宿主与原生安装包"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
         shell: bash
@@ -637,7 +802,6 @@ jobs:
             echo "==================== 05. Tauri v2 桌面端构建与打包 ===================="
             echo "开始时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-            # 锁定 Windows MSVC 原生链接器，防止 Git Bash /usr/bin/link.exe 干扰
             if [[ "${RUNNER_OS}" == "Windows" ]]; then
               CL_POSIX_PATH=$(which cl)
               MSVC_BIN_POSIX=$(dirname "${CL_POSIX_PATH}")
@@ -651,11 +815,16 @@ jobs:
               export APPIMAGE_EXTRACT_AND_RUN=1
             fi
 
-            python3 - <<'PY'
-          import json, os, struct, zlib
+            cp "dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}" "src-tauri/${SHARED_LIB_NAME}"
 
+            python3 - <<'PY'
+          import json, os, struct, sys, zlib
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(encoding="utf-8")
+
+          shared_lib = os.environ["SHARED_LIB_NAME"]
           os.makedirs("src-tauri/icons", exist_ok=True)
-          os.makedirs("src-tauri/resources", exist_ok=True)
           os.makedirs("src-tauri/capabilities", exist_ok=True)
 
           build_rs_path = "src-tauri/build.rs"
@@ -741,7 +910,9 @@ jobs:
                       "active": True,
                       "targets": "all",
                       "icon": ["icons/icon.png", "icons/icon.ico"],
-                      "resources": ["resources/*"]
+                      "resources": {
+                          shared_lib: shared_lib
+                      }
                   }
               }
               with open(conf_path, "w", encoding="utf-8") as f:
@@ -750,27 +921,16 @@ jobs:
 
             mkdir -p "src-tauri/target/release"
             mkdir -p "src-tauri/target/debug"
-            cp "dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}" "src-tauri/resources/"
-            cp "dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}" "src-tauri/target/release/"
-            cp "dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}" "src-tauri/target/debug/"
+            cp "dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}" "src-tauri/target/release/"
+            cp "dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}" "src-tauri/target/debug/"
 
-            # 1. 编译 Rust 桌面宿主程序（复用 target 缓存，秒级增量编译）
-            (
-              cd src-tauri
-              rustc --version
-              cargo --version
-              if [[ "${BUILD_TYPE}" == "Debug" ]]; then
-                cargo build
-              else
-                cargo build --release
-              fi
-            )
+            rustc --version
+            cargo --version
 
-            # 2. 使用预编译的 @tauri-apps/cli 快速打包原生安装程序（避免从源码编译 tauri-cli）
             if [[ "${BUILD_TYPE}" == "Debug" ]]; then
-              npx --yes @tauri-apps/cli@2.1.0 build --debug || echo "[警告] 安装包封装器部分跳过，已保留编译完成的桌面主程序二进制"
+              npx --yes @tauri-apps/cli@2.1.0 build --debug
             else
-              npx --yes @tauri-apps/cli@2.1.0 build || echo "[警告] 安装包封装器部分跳过，已保留编译完成的桌面主程序二进制"
+              npx --yes @tauri-apps/cli@2.1.0 build
             fi
 
             echo "结束时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -778,18 +938,18 @@ jobs:
           echo "05_TAURI_BUNDLE=SUCCESS" >> "${STAGE_STATUS_FILE}"
 
       # ------------------------------------------------------------------------
-      # 无论构建成功或失败（if: always()），强制保存最新增量编译缓存供下次秒级复用
+      # 无论构建成功或失败（if: always()），强制保存最新增量编译缓存供下次复用
       # ------------------------------------------------------------------------
       - name: "8B. [Always Cache] 保存 C++20 增量构建缓存"
         if: always() && hashFiles('build/CMakeCache.txt') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: build
           key: "cpp-${{ matrix.platform_id }}-${{ env.BUILD_TYPE }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.run_id }}"
 
       - name: "8C. [Always Cache] 保存前端 npm 依赖缓存"
         if: always() && needs.prepare-build.outputs.build_scope == 'full-app' && hashFiles('frontend/node_modules') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             ~/.npm
@@ -798,7 +958,7 @@ jobs:
 
       - name: "8D. [Always Cache] 保存 Rust Cargo 与 Tauri 编译缓存"
         if: always() && needs.prepare-build.outputs.build_scope == 'full-app' && hashFiles('src-tauri/target') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             ~/.cargo/bin
@@ -827,7 +987,7 @@ jobs:
 
           {
             echo "==================== 98. 二进制产物与动态库依赖诊断 ===================="
-            LIB_PATH="dist-kernel/${PLATFORM_ID}/${SHARED_LIB_NAME}"
+            LIB_PATH="dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}"
             if [[ -f "${LIB_PATH}" ]]; then
               ls -lh "${LIB_PATH}"
               if [[ "${RUNNER_OS}" == "Linux" ]]; then
@@ -859,8 +1019,15 @@ jobs:
             echo ""
             echo "- **任务最终状态**: \`${JOB_STATUS}\`"
             echo "- **目标运行环境**: \`${{ matrix.os }}\`"
-            echo "- **构建范围**: \`${BUILD_SCOPE}\` \vert{} **优化级别**: \`${BUILD_TYPE}\`"
+            echo "- **构建范围**: \`${BUILD_SCOPE}\` | **优化级别**: \`${BUILD_TYPE}\`"
             echo "- **报告生成时间**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "## 三大标准 ZIP 发布产物清单"
+            echo "| 产物编号 | 产物名称 | 内容说明 |"
+            echo "| :--- | :--- | :--- |"
+            echo "| **ZIP 1** | \`GeoStudio3D-source-run${{ github.run_number }}\` | 完整纯净工程源代码包（不含临时编译目录） |"
+            echo "| **ZIP 2** | \`GeoStudio3D-${PLATFORM_ID}-executable-run${{ github.run_number }}\` | 纯净可执行程序包（同目录 \`${APP_EXE_NAME}\` + \`${SHARED_LIB_NAME}\` + 安装程序） |"
+            echo "| **ZIP 3** | \`GeoStudio3D-${PLATFORM_ID}-sdk-run${{ github.run_number }}\` | 二次开发导入库 SDK 包（\`include/\` + \`lib/${IMPORT_LIB_NAME}\` + \`bin/${SHARED_LIB_NAME}\` + CMake 配置） |"
             echo ""
             echo "## 各阶段执行轨迹"
             echo '```text'
@@ -871,19 +1038,6 @@ jobs:
             echo '```text'
             grep -rnE -C 2 "(error( C[0-9]+|\[E[0-9]+\])?:|fatal error( C[0-9]+)?:|LNK[0-9]+:|FAILED|CMake Error|致命错误|严重错误)" "${LOG_DIR}"/*.log 2>/dev/null | head -n 120 || echo "未检测到致命编译或链接错误关键字。"
             echo '```'
-
-            echo ""
-            echo "## 完整日志压缩包文件说明"
-            echo "| 日志文件名 | 对应阶段 | 排查用途 |"
-            echo "| :--- | :--- | :--- |"
-            echo "| \`00_system_env.log\` | 环境快照 | 操作系统版本、磁盘空间与工具链版本 |"
-            echo "| \`01_toolchain_deps.log\` | 工具链依赖 | MSVC / APT / Homebrew 安装详情 |"
-            echo "| \`02_cpp_kernel_build.log\` | C++20 内核 | CMake 配置与编译器详细命令行及报错 |"
-            echo "| \`03_kernel_selftest.log\` | 内核自检 | GeoKernelBench 点云/三角网/土方放坡压测输出 |"
-            echo "| \`04_frontend_build.log\` | 前端构建 | npm 依赖安装、TypeScript 检查与 Vite 打包 |"
-            echo "| \`05_tauri_bundle.log\` | 桌面打包 | Rust FFI 编译与 Tauri 桌面程序构建日志 |"
-            echo "| \`98_binary_diagnostics.log\` | 依赖分析 | 动态库 C ABI 导出符号表与运行库依赖 |"
-            echo "| \`cmake-internals/\` | CMake 内部 | CMakeCache.txt 与 CMakeConfigureLog.yaml |"
           } > "${LOG_DIR}/99_diagnostics_summary.md"
 
           if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -892,49 +1046,210 @@ jobs:
 
       - name: "10. [Always] 上传详细构建与故障排查日志包"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: "build-logs-${{ matrix.platform_id }}-run${{ github.run_number }}"
           path: "${{ env.LOG_DIR }}"
           retention-days: 30
           if-no-files-found: warn
 
-      - name: "11. [Success] 归集发布产物与生成 SHA256 校验清单"
+      # ------------------------------------------------------------------------
+      # 步骤 11：分别封装产物 2（纯净可执行程序 ZIP）与产物 3（二次开发导入库 SDK ZIP）
+      # ------------------------------------------------------------------------
+      - name: "11. [Success] 分别打包【可执行程序 ZIP】与【二次开发导入库 SDK ZIP】"
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-          RELEASE_DIR="release-bundle/${PLATFORM_ID}"
-          mkdir -p "${RELEASE_DIR}/kernel"
-          cp -r "dist-kernel/${PLATFORM_ID}/"* "${RELEASE_DIR}/kernel/"
+
+          rm -rf "release-staging/${PLATFORM_ID}"
+          EXE_STAGE_DIR="release-staging/${PLATFORM_ID}/executable"
+          EXE_PKG_ROOT="${EXE_STAGE_DIR}/GeoStudio3D-${PLATFORM_ID}"
+          SDK_STAGE_DIR="release-staging/${PLATFORM_ID}/sdk"
+          SDK_PKG_ROOT="${SDK_STAGE_DIR}/GeoStudio3D-${PLATFORM_ID}-sdk"
+
+          mkdir -p "${EXE_PKG_ROOT}"
+          mkdir -p "${SDK_PKG_ROOT}/include/geo_kernel"
+          mkdir -p "${SDK_PKG_ROOT}/lib"
+          mkdir -p "${SDK_PKG_ROOT}/bin"
+          mkdir -p "${SDK_PKG_ROOT}/cmake"
+          mkdir -p "release-zips"
+
+          # ====================================================================
+          # A. 组装产物 2：纯净可执行程序目录（绝对不含 include/、.lib 或重复 resources/）
+          # ====================================================================
+          cp "dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}" "${EXE_PKG_ROOT}/"
+          if [[ -f "dist-kernel/${PLATFORM_ID}/bin/${BENCH_EXE_NAME}" ]]; then
+            cp "dist-kernel/${PLATFORM_ID}/bin/${BENCH_EXE_NAME}" "${EXE_PKG_ROOT}/"
+          fi
 
           if [[ "${BUILD_SCOPE}" == "full-app" ]]; then
-            mkdir -p "${RELEASE_DIR}/desktop-app"
+            APP_BIN=$(find src-tauri/target -maxdepth 3 -type f -name "${APP_EXE_NAME}" ! -path "*/deps/*" ! -path "*/build/*" | head -n 1 || true)
+            if [[ -n "${APP_BIN}" ]]; then
+              cp "${APP_BIN}" "${EXE_PKG_ROOT}/"
+              chmod +x "${EXE_PKG_ROOT}/${APP_EXE_NAME}" || true
+              echo "[成功] 可执行程序包已封装主程序: ${EXE_PKG_ROOT}/${APP_EXE_NAME}"
+            else
+              echo "[严重错误] 未找到桌面主程序产物: ${APP_EXE_NAME}"
+              exit 1
+            fi
+
+            mkdir -p "${EXE_PKG_ROOT}/installers"
             find src-tauri/target -maxdepth 5 -type f \( \
-              -name "geo-studio-3d*" -o \
-              -name "GeoStudio3D*" -o \
+              -name "*-setup.exe" -o \
               -name "*.msi" -o \
               -name "*.deb" -o \
               -name "*.rpm" -o \
               -name "*.AppImage" -o \
               -name "*.dmg" \
-            \) ! -name "*.d" ! -name "*.pdb" ! -path "*/build/*" ! -path "*/deps/*" ! -path "*/incremental/*" -exec cp {} "${RELEASE_DIR}/desktop-app/" \; || true
+            \) ! -path "*/build/*" ! -path "*/deps/*" -exec cp {} "${EXE_PKG_ROOT}/installers/" \; || true
+            rmdir "${EXE_PKG_ROOT}/installers" 2>/dev/null || true
           fi
 
-          cd "${RELEASE_DIR}"
-          find . -type f ! -name "SHA256SUMS.txt" -exec sha256sum {} + > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          # ====================================================================
+          # B. 组装产物 3：二次开发导入库与 SDK 目录（含头文件 + 导入库 .lib + 动态库 .dll + CMake 配置）
+          # ====================================================================
+          cp -r "dist-kernel/${PLATFORM_ID}/include/geo_kernel/"* "${SDK_PKG_ROOT}/include/geo_kernel/"
+          cp -r "dist-kernel/${PLATFORM_ID}/lib/"* "${SDK_PKG_ROOT}/lib/"
+          cp "dist-kernel/${PLATFORM_ID}/bin/${SHARED_LIB_NAME}" "${SDK_PKG_ROOT}/bin/"
 
-      - name: "12. [Success] 上传平台发布构建产物"
+          python3 - <<'PY'
+          import hashlib, os, stat, sys, zipfile
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(encoding="utf-8")
+
+          plat = os.environ["PLATFORM_ID"]
+          app_exe = os.environ["APP_EXE_NAME"]
+          bench_exe = os.environ["BENCH_EXE_NAME"]
+          shared_lib = os.environ["SHARED_LIB_NAME"]
+          import_lib = os.environ["IMPORT_LIB_NAME"]
+
+          exe_stage = f"release-staging/{plat}/executable"
+          exe_root = f"{exe_stage}/GeoStudio3D-{plat}"
+          exe_zip = f"release-zips/GeoStudio3D-{plat}-executable.zip"
+
+          sdk_stage = f"release-staging/{plat}/sdk"
+          sdk_root = f"{sdk_stage}/GeoStudio3D-{plat}-sdk"
+          sdk_zip = f"release-zips/GeoStudio3D-{plat}-sdk.zip"
+
+          # 1. 写入可执行程序包中文说明
+          exe_readme = (
+              "======================================================================\n"
+              f"  GeoStudio 3D ({plat}) 可执行程序绿色发行包\n"
+              "======================================================================\n"
+              f"1. 桌面三维主程序：直接双击运行 {app_exe} 即可启动三维点云与土方放坡系统\n"
+              f"   （核心动态库 {shared_lib} 已严格置于同级根目录，无需任何额外配置）。\n"
+              f"2. 命令行压测工具：在终端运行 {bench_exe} --points 1000000 --grid 0.5\n"
+              "   可执行亿级点云解析、三角网剖分、土方真值与多级放坡性能基准测试。\n"
+              "3. 若需进行 C/C++/C#/Python/Go 二次开发，请使用独立的 SDK 导入库压缩包\n"
+              f"   (GeoStudio3D-{plat}-sdk.zip)。\n"
+              "======================================================================\n"
+          )
+          with open(os.path.join(exe_root, "README_运行说明.txt"), "w", encoding="utf-8", newline="\r\n") as f:
+              f.write(exe_readme)
+
+          # 2. 写入二次开发导入库 SDK 包 CMake 配置文件（使用普通字符串，避免 YAML 解析误识别双花括号）
+          cmake_config = "\n".join([
+              f"# GeoKernelCore CMake 导入库配置文件 ({plat})",
+              'get_filename_component(_GEO_SDK_PREFIX "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)',
+              "",
+              "if(NOT TARGET GeoKernelCore::GeoKernelCore)",
+              "    add_library(GeoKernelCore::GeoKernelCore SHARED IMPORTED)",
+              "    set_target_properties(GeoKernelCore::GeoKernelCore PROPERTIES",
+              '        INTERFACE_INCLUDE_DIRECTORIES "${_GEO_SDK_PREFIX}/include"',
+              '        IMPORTED_LOCATION "${_GEO_SDK_PREFIX}/bin/' + shared_lib + '"',
+              '        IMPORTED_IMPLIB "${_GEO_SDK_PREFIX}/lib/' + import_lib + '"',
+              "    )",
+              "endif()",
+              "",
+          ])
+          with open(os.path.join(sdk_root, "cmake", "GeoKernelCoreConfig.cmake"), "w", encoding="utf-8", newline="\n") as f:
+              f.write(cmake_config)
+
+          sdk_readme = (
+              "======================================================================\n"
+              f"  GeoKernelCore ({plat}) 二次开发导入库与头文件 SDK 包\n"
+              "======================================================================\n"
+              "目录结构说明：\n"
+              "  - include/geo_kernel/geo_kernel_c_api.h : 跨语言标准扁平 C ABI 接口头文件\n"
+              "  - include/geo_kernel/*.hpp              : C++20 空间几何内核类头文件\n"
+              f"  - lib/{import_lib:<31} : 链接期导入库 (Import Library)\n"
+              f"  - bin/{shared_lib:<31} : 运行期动态链接库 (Runtime Shared Library)\n"
+              "  - cmake/GeoKernelCoreConfig.cmake       : CMake 一键导入配置文件\n\n"
+              "CMake 工程集成方式：\n"
+              '  list(APPEND CMAKE_PREFIX_PATH "/path/to/GeoStudio3D-sdk")\n'
+              "  find_package(GeoKernelCore REQUIRED)\n"
+              "  target_link_libraries(YourTarget PRIVATE GeoKernelCore::GeoKernelCore)\n"
+              "======================================================================\n"
+          )
+          with open(os.path.join(sdk_root, "README_二次开发说明.txt"), "w", encoding="utf-8", newline="\r\n") as f:
+              f.write(sdk_readme)
+
+          def write_sha256_and_pack_zip(stage_dir, pkg_root, out_zip_path):
+              sha_lines = []
+              for root, dirs, files in os.walk(pkg_root):
+                  dirs.sort()
+                  for fn in sorted(files):
+                      if fn == "SHA256SUMS.txt":
+                          continue
+                      full_path = os.path.join(root, fn)
+                      rel_path = os.path.relpath(full_path, pkg_root).replace("\\", "/")
+                      h = hashlib.sha256()
+                      with open(full_path, "rb") as rf:
+                          while True:
+                              chunk = rf.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              h.update(chunk)
+                      sha_lines.append(f"{h.hexdigest()}  {rel_path}")
+
+              with open(os.path.join(pkg_root, "SHA256SUMS.txt"), "w", encoding="utf-8", newline="\n") as sf:
+                  sf.write("\n".join(sha_lines) + "\n")
+
+              with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for root, dirs, files in os.walk(stage_dir):
+                      dirs.sort()
+                      for fn in sorted(files):
+                          full_path = os.path.join(root, fn)
+                          rel_path = os.path.relpath(full_path, stage_dir).replace("\\", "/")
+                          zinfo = zipfile.ZipInfo.from_file(full_path, arcname=rel_path)
+                          st_mode = os.stat(full_path).st_mode
+                          if st_mode & stat.S_IXUSR:
+                              zinfo.external_attr = (0o755 & 0xFFFF) << 16
+                          else:
+                              zinfo.external_attr = (0o644 & 0xFFFF) << 16
+                          with open(full_path, "rb") as rf:
+                              zf.writestr(zinfo, rf.read(), compress_type=zipfile.ZIP_DEFLATED)
+
+          write_sha256_and_pack_zip(exe_stage, exe_root, exe_zip)
+          write_sha256_and_pack_zip(sdk_stage, sdk_root, sdk_zip)
+
+          print(f"[打包完成] 产物 2 (可执行程序 ZIP): {exe_zip} ({os.path.getsize(exe_zip) / (1024*1024):.2f} MB)")
+          print(f"[打包完成] 产物 3 (二次开发导入库 SDK ZIP): {sdk_zip} ({os.path.getsize(sdk_zip) / (1024*1024):.2f} MB)")
+          PY
+
+      - name: "12. [Success] 上传产物 2：纯净可执行程序 ZIP 压缩包"
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: "release-artifacts-${{ matrix.platform_id }}-run${{ github.run_number }}"
-          path: "release-bundle/${{ matrix.platform_id }}"
+          name: "GeoStudio3D-${{ matrix.platform_id }}-executable-run${{ github.run_number }}"
+          path: "release-zips/GeoStudio3D-${{ matrix.platform_id }}-executable.zip"
+          compression-level: 0
+          retention-days: 30
+
+      - name: "13. [Success] 上传产物 3：二次开发导入库与 SDK ZIP 压缩包"
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: "GeoStudio3D-${{ matrix.platform_id }}-sdk-run${{ github.run_number }}"
+          path: "release-zips/GeoStudio3D-${{ matrix.platform_id }}-sdk.zip"
+          compression-level: 0
           retention-days: 30
 
   # ============================================================================
   # 阶段 2：WebAssembly (Emscripten WASM) 跨端目标构建（勾选 build_wasm 时运行）
+  # 同样分别输出可执行 Web 应用 ZIP 与二次开发静态导入库 SDK ZIP
   # ============================================================================
   build-wasm-target:
     name: "构建 [WebAssembly (Emscripten WASM)]"
@@ -950,12 +1265,12 @@ jobs:
 
     steps:
       - name: "1. 检出仓库源码"
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
       - name: "1B. [Cache] 恢复 WASM 增量编译与 npm 缓存"
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: |
             build-wasm
@@ -970,7 +1285,7 @@ jobs:
         with:
           version: "3.1.64"
 
-      - name: "3. 编译 C++20 几何内核为 WebAssembly (.wasm + .js)"
+      - name: "3. 编译 C++20 几何内核为 WebAssembly (.a 静态导入库 + .wasm/.js 运行模块)"
         shell: bash
         run: |
           set -euo pipefail
@@ -1000,14 +1315,20 @@ jobs:
 
             cmake --build build-wasm --parallel
 
-            mkdir -p "release-bundle/wasm-emscripten/include/geo_kernel"
-            cp -r include/geo_kernel/* "release-bundle/wasm-emscripten/include/geo_kernel/"
+            rm -rf "release-staging/wasm"
+            mkdir -p "release-staging/wasm/executable/GeoStudio3D-wasm-emscripten"
+            mkdir -p "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk/include/geo_kernel"
+            mkdir -p "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk/lib"
+            mkdir -p "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk/bin"
 
             STATIC_LIB=$(find build-wasm/lib -type f -name "libGeoKernelCore.a" | head -n 1)
             if [[ -z "${STATIC_LIB}" ]]; then
               echo "[严重错误] 未找到 WASM 静态库 build-wasm/lib/libGeoKernelCore.a"
               exit 1
             fi
+
+            cp -r include/geo_kernel/* "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk/include/geo_kernel/"
+            cp "${STATIC_LIB}" "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk/lib/"
 
             emcc "${STATIC_LIB}" \
               -O3 -msimd128 -pthread \
@@ -1017,16 +1338,17 @@ jobs:
               -sMAXIMUM_MEMORY=2GB \
               -sEXPORTED_FUNCTIONS='["_malloc","_free","_geo_get_version","_geo_get_last_error","_geo_project_create","_geo_project_destroy","_geo_default_dat_load_params","_geo_project_load_dat","_geo_default_octree_params","_geo_project_build_octree","_geo_project_query_visible_octree_nodes","_geo_project_fetch_octree_node_gpu_packet","_geo_default_tin_params","_geo_project_build_tin","_geo_project_query_elevation","_geo_project_get_dirty_tin_tiles","_geo_project_fetch_tin_tile_gpu_packet","_geo_project_pick_tin_ray","_geo_project_tin_flip_edge","_geo_project_tin_modify_vertex_z","_geo_project_tin_insert_vertex","_geo_project_tin_insert_breakline","_geo_project_tin_clip_polygon","_geo_project_tin_undo","_geo_project_tin_redo","_geo_project_tin_get_history_state","_geo_project_compute_earthwork_exact","_geo_project_compute_earthwork_grid","_geo_default_grading_params","_geo_project_compute_slope_grading"]' \
               -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","UTF8ToString","stringToUTF8","HEAPU8","HEAPF64","HEAPU32"]' \
-              -o "release-bundle/wasm-emscripten/geo_kernel_wasm.js"
+              -o "release-staging/wasm/executable/GeoStudio3D-wasm-emscripten/geo_kernel_wasm.js"
 
-            ls -lh "release-bundle/wasm-emscripten/"
+            cp "release-staging/wasm/executable/GeoStudio3D-wasm-emscripten/geo_kernel_wasm."* \
+               "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk/bin/"
           } 2>&1 | tee "${LOG_FILE}"
 
-      - name: "4. [Full-App] 配置 Node.js 20 环境"
+      - name: "4. [Full-App] 配置 Node.js 24 LTS 环境"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: "5. [Full-App] 构建 Web 前端静态发布包"
         if: needs.prepare-build.outputs.build_scope == 'full-app'
@@ -1049,13 +1371,13 @@ jobs:
             cd frontend
             npm install --prefer-offline --no-audit --no-fund
             npm run build
-            mkdir -p "../release-bundle/wasm-emscripten/web-dist"
-            cp -r dist/* "../release-bundle/wasm-emscripten/web-dist/"
+            mkdir -p "../release-staging/wasm/executable/GeoStudio3D-wasm-emscripten/web-dist"
+            cp -r dist/* "../release-staging/wasm/executable/GeoStudio3D-wasm-emscripten/web-dist/"
           } 2>&1 | tee "${LOG_FILE}"
 
       - name: "5B. [Always Cache] 保存 WASM 增量编译缓存"
         if: always() && hashFiles('build-wasm/CMakeCache.txt') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: |
             build-wasm
@@ -1074,18 +1396,81 @@ jobs:
 
       - name: "7. [Always] 上传 WASM 详细构建日志包"
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: "build-logs-wasm-emscripten-run${{ github.run_number }}"
           path: "${{ env.LOG_DIR }}"
           retention-days: 30
           if-no-files-found: warn
 
-      - name: "8. [Success] 上传 WASM 与 Web 发布产物"
+      - name: "8. [Success] 打包 WASM 可执行包与二次开发 SDK ZIP 压缩包"
         if: success()
-        uses: actions/upload-artifact@v4
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-zips
+          python3 - <<'PY'
+          import hashlib, os, sys, zipfile
+
+          if hasattr(sys.stdout, "reconfigure"):
+              sys.stdout.reconfigure(encoding="utf-8")
+
+          def write_sha_and_pack(stage_dir, pkg_root, out_zip):
+              sha_lines = []
+              for root, dirs, files in os.walk(pkg_root):
+                  dirs.sort()
+                  for fn in sorted(files):
+                      if fn == "SHA256SUMS.txt":
+                          continue
+                      full_path = os.path.join(root, fn)
+                      rel_path = os.path.relpath(full_path, pkg_root).replace("\\", "/")
+                      h = hashlib.sha256()
+                      with open(full_path, "rb") as rf:
+                          while True:
+                              chunk = rf.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              h.update(chunk)
+                      sha_lines.append(f"{h.hexdigest()}  {rel_path}")
+              with open(os.path.join(pkg_root, "SHA256SUMS.txt"), "w", encoding="utf-8", newline="\n") as sf:
+                  sf.write("\n".join(sha_lines) + "\n")
+
+              with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                  for root, dirs, files in os.walk(stage_dir):
+                      dirs.sort()
+                      for fn in sorted(files):
+                          full_path = os.path.join(root, fn)
+                          rel_path = os.path.relpath(full_path, stage_dir).replace("\\", "/")
+                          zf.write(full_path, rel_path)
+              print(f"[打包完成] 已生成: {out_zip} ({os.path.getsize(out_zip) / (1024*1024):.2f} MB)")
+
+          write_sha_and_pack(
+              "release-staging/wasm/executable",
+              "release-staging/wasm/executable/GeoStudio3D-wasm-emscripten",
+              "release-zips/GeoStudio3D-wasm-emscripten-executable.zip"
+          )
+          write_sha_and_pack(
+              "release-staging/wasm/sdk",
+              "release-staging/wasm/sdk/GeoStudio3D-wasm-emscripten-sdk",
+              "release-zips/GeoStudio3D-wasm-emscripten-sdk.zip"
+          )
+          PY
+
+      - name: "9. [Success] 上传 WASM 可执行程序 ZIP 产物"
+        if: success()
+        uses: actions/upload-artifact@v6
         with:
-          name: "release-artifacts-wasm-emscripten-run${{ github.run_number }}"
-          path: "release-bundle/wasm-emscripten"
+          name: "GeoStudio3D-wasm-emscripten-executable-run${{ github.run_number }}"
+          path: "release-zips/GeoStudio3D-wasm-emscripten-executable.zip"
+          compression-level: 0
+          retention-days: 30
+
+      - name: "10. [Success] 上传 WASM 二次开发导入库 SDK ZIP 产物"
+        if: success()
+        uses: actions/upload-artifact@v6
+        with:
+          name: "GeoStudio3D-wasm-emscripten-sdk-run${{ github.run_number }}"
+          path: "release-zips/GeoStudio3D-wasm-emscripten-sdk.zip"
+          compression-level: 0
           retention-days: 30
 
