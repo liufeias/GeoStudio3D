@@ -1,6 +1,6 @@
 /* ============================================================================
- * GeoStudio 3D 企业级桌面测绘与土方放坡系统主样式表
- * 采用暗色工程级配色方案，最大化 3D 视口高程色带与等高线视觉对比度
+ * GeoStudio 3D 企业级任意多期测绘点云与土方放坡系统主样式表
+ * 采用暗色工程级高对比度界面配色，突出三维地形等高线、真实拓扑格网线与多期图层层次
  * ============================================================================ */
 
 :root {
@@ -44,7 +44,26 @@ body,
   flex-direction: column;
 }
 
-/* 顶部工具栏 */
+/* 自定义暗色细滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-input);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #33455d;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #47607f;
+}
+
+/* 顶部工程主工具栏 */
 .top-toolbar {
   height: 46px;
   background: var(--bg-panel);
@@ -126,9 +145,44 @@ body,
   border-color: var(--accent-hover);
 }
 
+.btn-danger-ghost {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.35);
+  color: #fca5a5;
+}
+
+.btn-danger-ghost:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.22);
+  border-color: var(--accent-danger);
+  color: #ffffff;
+}
+
 .btn-sm {
-  padding: 4px 8px;
+  padding: 3px 8px;
   font-size: 11px;
+}
+
+.btn-xs {
+  padding: 2px 6px;
+  font-size: 10px;
+}
+
+.btn-full {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent-cyan);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
 }
 
 /* 主工作区三栏布局 */
@@ -140,7 +194,7 @@ body,
 }
 
 .side-panel {
-  width: 295px;
+  width: 315px;
   background: var(--bg-panel);
   padding: 10px;
   overflow-y: auto;
@@ -155,7 +209,7 @@ body,
 }
 
 .right-panel {
-  width: 325px;
+  width: 330px;
   border-left: 1px solid var(--border-subtle);
 }
 
@@ -166,6 +220,21 @@ body,
   padding: 10px 12px;
 }
 
+.card-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.card-header-row .card-title {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
 .card-title {
   font-size: 12px;
   font-weight: 700;
@@ -173,6 +242,151 @@ body,
   margin-bottom: 8px;
   padding-bottom: 5px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.sub-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 5px;
+}
+
+/* 多期土方数据列表卡片样式 */
+.period-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 250px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+
+.empty-period-hint {
+  padding: 12px 10px;
+  background: var(--bg-input);
+  border: 1px dashed var(--border-subtle);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.period-item {
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  padding: 7px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: border-color 0.15s ease;
+}
+
+.period-item.active-edit {
+  border-color: var(--accent-cyan);
+  box-shadow: inset 2px 0 0 var(--accent-cyan);
+}
+
+.period-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.period-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.period-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
+.period-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.period-badge-edit {
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(14, 165, 233, 0.22);
+  color: #38bdf8;
+  flex-shrink: 0;
+}
+
+.period-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.period-toggles-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.period-inline-checks {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.period-inline-checks label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.period-opacity-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.period-opacity-wrap input[type='range'] {
+  width: 56px;
+  height: 4px;
+}
+
+.period-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.period-actions-row .btn {
+  flex: 1;
+  text-align: center;
+}
+
+.derived-layers-box {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
 }
 
 .checkbox-row {
@@ -194,6 +408,17 @@ body,
   font-size: 11px;
   color: var(--text-secondary);
   margin-bottom: 4px;
+}
+
+.label-with-action {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.label-with-action label {
+  margin-bottom: 0;
 }
 
 .form-control {
@@ -242,6 +467,10 @@ input[type='range'] {
   transition: all 0.15s ease;
 }
 
+.tool-btn-wide {
+  grid-column: span 2;
+}
+
 .tool-btn:hover {
   color: var(--text-primary);
   border-color: var(--accent-cyan);
@@ -287,7 +516,7 @@ input[type='range'] {
 
 .hud-overlay {
   position: absolute;
-  background: rgba(15, 22, 32, 0.82);
+  background: rgba(15, 22, 32, 0.84);
   backdrop-filter: blur(6px);
   border: 1px solid rgba(56, 189, 248, 0.25);
   border-radius: 5px;
@@ -313,10 +542,12 @@ input[type='range'] {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
 }
 
 #hud-status-msg {
   color: #38bdf8;
+  text-align: right;
 }
 
 /* 土方与放坡结果统计栅格 */

@@ -1,45 +1,39 @@
 /**
  * @file kernel_bridge.ts
- * @brief 多平台解耦内核通信抽象层与前端调试级带时间戳日志器
+ * @brief 多平台解耦几何内核通信抽象层与前端高精度调试日志器
  *
- * 解耦与诊断设计规范：
- *   1. 渲染器与所有业务面板仅依赖 IGeoKernelBridge 接口，完全屏蔽底层是 Tauri 本地动态库、
- *      还是远程计算节点。
- *   2. 桌面端模式下，几何数据瓦片通过自定义协议 `geotile://localhost/...` 直接返回原生
- *      ArrayBuffer 字节流（零 JSON/Base64 膨胀开销）。
- *   3. 调试日志规范（Debug 专属，Release 零性能损耗）：
- *      - `FrontendDebugLogger` 在应用启动时向宿主查询是否为 Debug 构建（`cmd_is_debug_mode`）。
- *      - 在 Debug 构建下：所有日志均携带精确到毫秒的本地日期时间 `[YYYY-MM-DD HH:MM:SS.mmm]`，
- *        同时输出到浏览器 DevTools 控制台与 Tauri 后端持久化调试日志文件，便于完整追踪全链路异常。
- *      - 在 Release 构建下：`isEnabled()` 恒为 `false`，所有日志调用采用惰性函数求值，直接短路返回，
- *        不执行任何字符串格式化、不产生内存分配、不发起任何日志 IPC 通信。
+ * 企业级架构特性：
+ *   1. 全功能任意期数动态管理：
+ *      - 支持动态创建新期数槽位 (`createPeriodSlot`)、安全卸载单期 (`removePeriodSlot`)、
+ *        清空工程全部期数 (`clearAllPeriods`) 及批量多选 `.dat` 点云文件导入 (`pickDatFilesDialog`)。
+ *   2. 跨平台零拷贝二进制瓦片流网关：
+ *      - 自动适配 Windows WebView2 (`http://geotile.localhost/...`) 与 macOS/Linux (`geotile://localhost/...`)；
+ *      - 强制 `cache: 'no-store'` 并携带递增版本号参数，杜绝编辑或重载后读取 WebView 陈旧瓦片缓存。
+ *   3. Debug 专属带毫秒时间戳日志器（Release 零开销短路）：
+ *      - Debug 模式下同步输出至 DevTools 与原生后端持久化日志文件；
+ *      - Release 模式下惰性日志回调直接短路，零字符串拼接与零 IPC 开销。
  */
+
 import {
   CameraQueryInput,
   DatSummary,
   DecodedPointCloudPacket,
   DecodedTinMeshPacket,
   EarthworkSummary,
+  ElevationQueryResult,
   GradingParams,
   GradingSummary,
   OctreeSummary,
   RayHitResult,
   SlopeStageSpec,
-  SurfaceSlot,
+  SlotId,
   TinSummary,
   VisibleOctreeNodesResult,
   decodePointCloudPacket,
   decodeTinMeshPacket,
 } from '../types/geo_protocol';
 
-/**
- * 统一日志级别定义
- */
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
-
-/**
- * 惰性日志消息构造器类型（避免 Release 模式下提前拼接日志字符串消耗性能）
- */
 export type LazyLogMessage = string | (() => string);
 
 interface PendingBootLog {
@@ -50,7 +44,7 @@ interface PendingBootLog {
 }
 
 /**
- * 格式化当前本地日期时间为 `YYYY-MM-DD HH:MM:SS.mmm` 高精度字符串
+ * 格式化本地高精度时间戳 `YYYY-MM-DD HH:MM:SS.mmm`
  */
 export function formatLocalTimestamp(date = new Date()): string {
   const yyyy = date.getFullYear();
@@ -64,7 +58,7 @@ export function formatLocalTimestamp(date = new Date()): string {
 }
 
 /**
- * 提取任意异常对象的完整诊断文本（含错误名称、消息文本、堆栈及嵌套 cause）
+ * 提取任意异常对象的完整中文诊断文本（含错误堆栈与嵌套 cause）
  */
 export function formatErrorDetails(err: unknown): string {
   if (err instanceof Error) {
@@ -100,21 +94,14 @@ export class FrontendDebugLogger {
   private readonly maxBootQueueSize = 128;
 
   constructor() {
-    // 在尚未完成后端调试标志握手前，仅当 Vite 开发服务器明确处于 DEV 环境时预开启
     const importMeta = import.meta as unknown as { env?: { DEV?: boolean } };
     this.debugEnabled = importMeta.env?.DEV === true;
   }
 
-  /**
-   * 判定当前是否处于启用详细调试日志模式
-   */
   isEnabled(): boolean {
     return this.debugEnabled;
   }
 
-  /**
-   * 绑定内核通信桥接器并向原生宿主查询真实编译模式（Debug / Release）
-   */
   async initWithBridge(bridge: IGeoKernelBridge): Promise<void> {
     this.bridge = bridge;
     try {
@@ -125,23 +112,26 @@ export class FrontendDebugLogger {
     this.initialized = true;
 
     if (!this.debugEnabled) {
-      // Release 模式下立即清空并释放启动缓冲队列
       this.bootQueue.length = 0;
       return;
     }
 
-    // Debug 模式下回放启动阶段缓存的早期日志至持久化日志文件
     while (this.bootQueue.length > 0) {
       const item = this.bootQueue.shift();
       if (item) {
         this.emitToConsole(item.timestamp, item.level, item.module, item.message);
-        void this.forwardToBackend(item.level, item.module, `[启动缓冲 @ ${item.timestamp}] ${item.message}`);
+        void this.forwardToBackend(
+          item.level,
+          item.module,
+          `[启动缓冲 @ ${item.timestamp}] ${item.message}`
+        );
       }
     }
 
     this.info(
       'LOGGER',
-      () => `前端高精度调试日志器初始化完成 | 通信后端: ${bridge.backendName} | 调试模式: 已开启`
+      () =>
+        `前端高精度调试日志器初始化完成 | 通信后端: ${bridge.backendName} | 调试模式: 已开启`
     );
   }
 
@@ -156,14 +146,16 @@ export class FrontendDebugLogger {
   warn(module: string, msgOrFn: LazyLogMessage, err?: unknown): void {
     if (!this.shouldCapture()) return;
     const base = typeof msgOrFn === 'function' ? msgOrFn() : msgOrFn;
-    const fullMsg = typeof err !== 'undefined' ? `${base} | 详情: ${formatErrorDetails(err)}` : base;
+    const fullMsg =
+      typeof err !== 'undefined' ? `${base} | 详情: ${formatErrorDetails(err)}` : base;
     this.dispatch('WARN', module, fullMsg);
   }
 
   error(module: string, msgOrFn: LazyLogMessage, err?: unknown): void {
     if (!this.shouldCapture()) return;
     const base = typeof msgOrFn === 'function' ? msgOrFn() : msgOrFn;
-    const fullMsg = typeof err !== 'undefined' ? `${base} | 异常详情: ${formatErrorDetails(err)}` : base;
+    const fullMsg =
+      typeof err !== 'undefined' ? `${base} | 异常详情: ${formatErrorDetails(err)}` : base;
     this.dispatch('ERROR', module, fullMsg);
   }
 
@@ -193,7 +185,12 @@ export class FrontendDebugLogger {
     void this.forwardToBackend(level, module, message);
   }
 
-  private emitToConsole(ts: string, level: LogLevel, module: string, message: string): void {
+  private emitToConsole(
+    ts: string,
+    level: LogLevel,
+    module: string,
+    message: string
+  ): void {
     const line = `[${ts}] [${level}] [FE:${module}] ${message}`;
     switch (level) {
       case 'DEBUG':
@@ -211,7 +208,11 @@ export class FrontendDebugLogger {
     }
   }
 
-  private async forwardToBackend(level: LogLevel, module: string, message: string): Promise<void> {
+  private async forwardToBackend(
+    level: LogLevel,
+    module: string,
+    message: string
+  ): Promise<void> {
     if (!this.bridge || !this.debugEnabled || this.isForwarding) {
       return;
     }
@@ -219,129 +220,117 @@ export class FrontendDebugLogger {
     try {
       await this.bridge.writeDebugLog(level, module, message);
     } catch {
-      // 日志转发通道本身发生异常时静默保护，严禁引发无限递归异常
+      // 防止日志通道异常触发递归错误
     } finally {
       this.isForwarding = false;
     }
   }
 }
 
-/**
- * 全局共享前端日志单例
- */
 export const frontendLogger = new FrontendDebugLogger();
 
 /**
- * 几何内核统一异步通信契约接口
+ * 空间几何内核跨平台异步通信统一契约接口
  */
 export interface IGeoKernelBridge {
   readonly backendName: string;
 
-  /** 查询原生宿主是否处于 Debug 调试编译模式 */
   isDebugMode(): Promise<boolean>;
-
-  /** 将前端带级别与模块名的诊断日志写入原生调试日志通道（Release 下空实现） */
   writeDebugLog(level: LogLevel, module: string, message: string): Promise<void>;
 
-  /** 打开原生文件对话框选择 .dat 文件（浏览器模式下自动回退为路径输入/上传） */
+  /** 打开原生文件选择对话框，支持单选或批量多选 .dat/.txt/.csv 测绘点云文件 */
+  pickDatFilesDialog(title: string, allowMultiple?: boolean): Promise<string[]>;
+  /** 便捷单文件选择接口 */
   pickDatFileDialog(title: string): Promise<string | null>;
 
-  /** 导入 .dat 点云文件并构建八叉树与初始三角网 */
-  loadDatFile(
-    slot: SurfaceSlot,
-    filePath: string,
-    coordOrder: 0 | 1
-  ): Promise<DatSummary>;
+  /** 动态期数槽位生命周期管理 */
+  createPeriodSlot(): Promise<SlotId>;
+  removePeriodSlot(slot: SlotId): Promise<void>;
+  clearAllPeriods(): Promise<void>;
+  listPeriodSlots(): Promise<SlotId[]>;
 
-  buildOctree(slot: SurfaceSlot): Promise<OctreeSummary>;
-
+  /** 点云导入、八叉树与分块三角网构建 */
+  loadDatFile(slot: SlotId, filePath: string, coordOrder: 0 | 1): Promise<DatSummary>;
+  buildOctree(slot: SlotId): Promise<OctreeSummary>;
   buildTin(
-    slot: SurfaceSlot,
+    slot: SlotId,
     decimationGridSize: number,
-    tileSize: number
+    tileSize: number,
+    maxEdgeLength?: number
   ): Promise<TinSummary>;
 
+  /** 视锥体 LOD 八叉树与脏瓦片 GPU 数据流 */
   queryVisibleOctreeNodes(
-    slot: SurfaceSlot,
+    slot: SlotId,
     query: CameraQueryInput
   ): Promise<VisibleOctreeNodesResult>;
-
-  fetchOctreeNodePacket(
-    slot: SurfaceSlot,
-    nodeId: number
-  ): Promise<DecodedPointCloudPacket>;
-
-  getDirtyTinTiles(slot: SurfaceSlot): Promise<number[]>;
-
+  fetchOctreeNodePacket(slot: SlotId, nodeId: number): Promise<DecodedPointCloudPacket>;
+  getDirtyTinTiles(slot: SlotId): Promise<number[]>;
   fetchTinTilePacket(
-    slot: SurfaceSlot,
+    slot: SlotId,
     tileIndex: number,
     clearDirtyFlag: boolean
   ): Promise<DecodedTinMeshPacket>;
 
+  /** 高程内插查询与三维射线拾取 */
   queryElevationAt(
-    slot: SurfaceSlot,
+    slot: SlotId,
     localX: number,
     localY: number
-  ): Promise<{ localZ: number; globalZ: number } | null>;
-
+  ): Promise<ElevationQueryResult | null>;
   pickTinByRay(
-    slot: SurfaceSlot,
+    slot: SlotId,
     rayOrigin: [number, number, number],
     rayDir: [number, number, number]
   ): Promise<RayHitResult>;
 
+  /** 交互式三角网拓扑编辑与多步增量 Undo/Redo */
   flipTinEdge(
-    slot: SurfaceSlot,
+    slot: SlotId,
     triangleId: number,
     edgeSlot: number,
     forceFlip: boolean
   ): Promise<void>;
-
   modifyVertexElevation(
-    slot: SurfaceSlot,
+    slot: SlotId,
     vertexId: number,
     newLocalZ: number
   ): Promise<void>;
-
   insertVertex(
-    slot: SurfaceSlot,
+    slot: SlotId,
     localXyz: [number, number, number],
     codeId: number
   ): Promise<number>;
-
   insertBreakline(
-    slot: SurfaceSlot,
+    slot: SlotId,
     polyline: Array<[number, number, number]>,
     codeId: number,
     interpolateZFromTin: boolean
   ): Promise<void>;
-
+  deleteVertex(slot: SlotId, vertexId: number): Promise<void>;
   clipByPolygon(
-    slot: SurfaceSlot,
+    slot: SlotId,
     polygon: Array<[number, number, number]>,
     keepInside: boolean
   ): Promise<void>;
+  undoTin(slot: SlotId): Promise<void>;
+  redoTin(slot: SlotId): Promise<void>;
+  getHistoryState(slot: SlotId): Promise<{ canUndo: boolean; canRedo: boolean }>;
 
-  undoTin(slot: SurfaceSlot): Promise<void>;
-  redoTin(slot: SurfaceSlot): Promise<void>;
-  getHistoryState(slot: SurfaceSlot): Promise<{ canUndo: boolean; canRedo: boolean }>;
-
+  /** 任意两期土方算量与多级放坡建模 */
   computeEarthworkExact(
-    period1Slot: SurfaceSlot,
-    period2Slot: SurfaceSlot,
+    period1Slot: SlotId,
+    period2Slot: SlotId,
     roiPolygon?: Array<[number, number, number]>
   ): Promise<EarthworkSummary>;
-
   computeEarthworkGrid(
-    period1Slot: SurfaceSlot,
-    period2Slot: SurfaceSlot,
+    period1Slot: SlotId,
+    period2Slot: SlotId,
     gridStep: number,
     roiPolygon?: Array<[number, number, number]>
   ): Promise<EarthworkSummary>;
-
   computeSlopeGrading(
-    originalSlot: SurfaceSlot,
+    originalSlot: SlotId,
     basePolygon: Array<[number, number, number]>,
     stages: SlopeStageSpec[],
     params: GradingParams,
@@ -350,10 +339,29 @@ export interface IGeoKernelBridge {
 }
 
 // ==============================================================================
-// 实现 1：Tauri v2 原生桌面桥接器（Rust FFI + geotile:// 零拷贝二进制流）
+// 实现 1：Tauri v2 原生桌面桥接器（Rust FFI + geotile:// 零拷贝二进制瓦片网关）
 // ==============================================================================
 export class TauriNativeKernelBridge implements IGeoKernelBridge {
-  readonly backendName = 'Tauri v2 Native C++20 Kernel';
+  readonly backendName = 'Tauri v2 Native C++20 Multi-Period Kernel';
+  private fetchSeq = 0;
+
+  /**
+   * 构造跨平台兼容且防缓存污染的 geotile 自定义协议 URL
+   * - Windows (WebView2): `http://geotile.localhost/...`
+   * - macOS / Linux (WKWebView / WebKitGTK): `geotile://localhost/...`
+   */
+  private buildGeoTileUrl(path: string, queryParams?: Record<string, string | number>): string {
+    const isWindows = /windows/i.test(navigator.userAgent);
+    const origin = isWindows ? 'http://geotile.localhost' : 'geotile://localhost';
+    const params = new URLSearchParams();
+    if (queryParams) {
+      for (const [k, v] of Object.entries(queryParams)) {
+        params.set(k, String(v));
+      }
+    }
+    params.set('_seq', String(++this.fetchSeq));
+    return `${origin}${path}?${params.toString()}`;
+  }
 
   private async invokeCmd<T>(
     cmd: string,
@@ -363,7 +371,10 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
     const logOn = !skipLog && frontendLogger.isEnabled();
     const startMs = logOn ? performance.now() : 0;
     if (logOn) {
-      frontendLogger.debug('IPC', () => `调用原生命令 ${cmd} | 参数: ${JSON.stringify(args ?? {})}`);
+      frontendLogger.debug(
+        'IPC',
+        () => `调用原生命令 ${cmd} | 参数: ${JSON.stringify(args ?? {})}`
+      );
     }
     try {
       const { invoke } = await import('@tauri-apps/api/core');
@@ -395,35 +406,57 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
     await this.invokeCmd<void>('cmd_write_frontend_log', { level, module, message }, true);
   }
 
-  async pickDatFileDialog(title: string): Promise<string | null> {
-    frontendLogger.debug('DIALOG', () => `打开原生文件选择框: "${title}"`);
+  async pickDatFilesDialog(title: string, allowMultiple = true): Promise<string[]> {
+    frontendLogger.debug('DIALOG', () => `打开原生文件选择框: "${title}", 多选=${allowMultiple}`);
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({
         title,
-        multiple: false,
+        multiple: allowMultiple,
         filters: [
           { name: '测绘点云数据 (*.dat, *.txt, *.csv)', extensions: ['dat', 'txt', 'csv'] },
           { name: '所有文件', extensions: ['*'] },
         ],
       });
-      if (typeof selected === 'string') {
-        frontendLogger.info('DIALOG', () => `用户选中文件: ${selected}`);
-        return selected;
+      if (Array.isArray(selected)) {
+        const list = selected.filter((p): p is string => typeof p === 'string' && p.length > 0);
+        frontendLogger.info('DIALOG', () => `用户批量选中 ${list.length} 个点云文件`);
+        return list;
+      }
+      if (typeof selected === 'string' && selected.length > 0) {
+        frontendLogger.info('DIALOG', () => `用户选中单个点云文件: ${selected}`);
+        return [selected];
       }
       frontendLogger.debug('DIALOG', '用户取消了文件选择');
-      return null;
+      return [];
     } catch (err) {
       frontendLogger.error('DIALOG', () => `文件选择对话框调用异常 (${title})`, err);
       throw err;
     }
   }
 
-  async loadDatFile(
-    slot: SurfaceSlot,
-    filePath: string,
-    coordOrder: 0 | 1
-  ): Promise<DatSummary> {
+  async pickDatFileDialog(title: string): Promise<string | null> {
+    const files = await this.pickDatFilesDialog(title, false);
+    return files.length > 0 ? files[0] : null;
+  }
+
+  async createPeriodSlot(): Promise<SlotId> {
+    return this.invokeCmd<SlotId>('cmd_create_period_slot');
+  }
+
+  async removePeriodSlot(slot: SlotId): Promise<void> {
+    await this.invokeCmd<void>('cmd_remove_period_slot', { slot });
+  }
+
+  async clearAllPeriods(): Promise<void> {
+    await this.invokeCmd<void>('cmd_clear_all_periods');
+  }
+
+  async listPeriodSlots(): Promise<SlotId[]> {
+    return this.invokeCmd<SlotId[]>('cmd_list_period_slots');
+  }
+
+  async loadDatFile(slot: SlotId, filePath: string, coordOrder: 0 | 1): Promise<DatSummary> {
     return this.invokeCmd<DatSummary>('cmd_load_dat', {
       slot,
       filePath,
@@ -431,27 +464,28 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
     });
   }
 
-  async buildOctree(slot: SurfaceSlot): Promise<OctreeSummary> {
+  async buildOctree(slot: SlotId): Promise<OctreeSummary> {
     return this.invokeCmd<OctreeSummary>('cmd_build_octree', { slot });
   }
 
   async buildTin(
-    slot: SurfaceSlot,
+    slot: SlotId,
     decimationGridSize: number,
-    tileSize: number
+    tileSize: number,
+    maxEdgeLength = 0
   ): Promise<TinSummary> {
     return this.invokeCmd<TinSummary>('cmd_build_tin', {
       slot,
       decimationGridSize,
       tileSize,
+      maxEdgeLength,
     });
   }
 
   async queryVisibleOctreeNodes(
-    slot: SurfaceSlot,
+    slot: SlotId,
     query: CameraQueryInput
   ): Promise<VisibleOctreeNodesResult> {
-    // 高频帧级视锥查询使用 skipLog=true 避免与上层重复刷屏，由上层 OctreeLodManager 汇总输出精简日志
     return this.invokeCmd<VisibleOctreeNodesResult>(
       'cmd_query_visible_octree_nodes',
       { slot, query },
@@ -460,16 +494,16 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async fetchOctreeNodePacket(
-    slot: SurfaceSlot,
+    slot: SlotId,
     nodeId: number
   ): Promise<DecodedPointCloudPacket> {
-    const url = `http://geotile.localhost/octree/${slot}/${nodeId}`;
+    const url = this.buildGeoTileUrl(`/octree/${slot}/${nodeId}`);
     const logOn = frontendLogger.isEnabled();
     const startMs = logOn ? performance.now() : 0;
-    const response = await fetch(url);
+    const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) {
       const errText = await response.text();
-      const msg = `拉取八叉树节点 #${nodeId} 失败 (HTTP ${response.status}): ${errText}`;
+      const msg = `拉取八叉树节点 #${nodeId} (槽位 ${slot}) 失败 (HTTP ${response.status}): ${errText}`;
       frontendLogger.error('GEOTILE', msg);
       throw new Error(msg);
     }
@@ -479,29 +513,31 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
       const costMs = (performance.now() - startMs).toFixed(2);
       frontendLogger.debug(
         'GEOTILE',
-        () => `拉取八叉树节点 #${nodeId} (槽位 ${slot}) 成功: ${pkt.header.vertexCount} 点, ${buffer.byteLength} 字节, 耗时 ${costMs} ms`
+        () =>
+          `拉取八叉树节点 #${nodeId} (槽位 ${slot}) 成功: ${pkt.header.vertexCount} 点, ${buffer.byteLength} 字节, 耗时 ${costMs} ms`
       );
     }
     return pkt;
   }
 
-  async getDirtyTinTiles(slot: SurfaceSlot): Promise<number[]> {
+  async getDirtyTinTiles(slot: SlotId): Promise<number[]> {
     return this.invokeCmd<number[]>('cmd_get_dirty_tin_tiles', { slot });
   }
 
   async fetchTinTilePacket(
-    slot: SurfaceSlot,
+    slot: SlotId,
     tileIndex: number,
     clearDirtyFlag: boolean
   ): Promise<DecodedTinMeshPacket> {
-    const clearFlag = clearDirtyFlag ? 1 : 0;
-    const url = `http://geotile.localhost/tin/${slot}/${tileIndex}?clear=${clearFlag}`;
+    const url = this.buildGeoTileUrl(`/tin/${slot}/${tileIndex}`, {
+      clear: clearDirtyFlag ? 1 : 0,
+    });
     const logOn = frontendLogger.isEnabled();
     const startMs = logOn ? performance.now() : 0;
-    const response = await fetch(url);
+    const response = await fetch(url, { cache: 'no-store' });
     if (!response.ok) {
       const errText = await response.text();
-      const msg = `拉取三角网瓦片 #${tileIndex} 失败 (HTTP ${response.status}): ${errText}`;
+      const msg = `拉取三角网瓦片 #${tileIndex} (槽位 ${slot}) 失败 (HTTP ${response.status}): ${errText}`;
       frontendLogger.error('GEOTILE', msg);
       throw new Error(msg);
     }
@@ -511,18 +547,19 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
       const costMs = (performance.now() - startMs).toFixed(2);
       frontendLogger.debug(
         'GEOTILE',
-        () => `拉取三角网瓦片 #${tileIndex} (槽位 ${slot}, rev=${pkt.header.revision}) 成功: ${pkt.header.vertexCount} 顶点, ${Math.floor(pkt.header.indexCount / 3)} 三角形, ${buffer.byteLength} 字节, 耗时 ${costMs} ms`
+        () =>
+          `拉取三角网瓦片 #${tileIndex} (槽位 ${slot}, rev=${pkt.header.revision}) 成功: ${pkt.header.vertexCount} 顶点, ${Math.floor(pkt.header.indexCount / 3)} 三角形, ${buffer.byteLength} 字节, 耗时 ${costMs} ms`
       );
     }
     return pkt;
   }
 
   async queryElevationAt(
-    slot: SurfaceSlot,
+    slot: SlotId,
     localX: number,
     localY: number
-  ): Promise<{ localZ: number; globalZ: number } | null> {
-    return this.invokeCmd<{ localZ: number; globalZ: number } | null>('cmd_query_elevation', {
+  ): Promise<ElevationQueryResult | null> {
+    return this.invokeCmd<ElevationQueryResult | null>('cmd_query_elevation', {
       slot,
       localX,
       localY,
@@ -530,11 +567,10 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async pickTinByRay(
-    slot: SurfaceSlot,
+    slot: SlotId,
     rayOrigin: [number, number, number],
     rayDir: [number, number, number]
   ): Promise<RayHitResult> {
-    // 鼠标移动期间 35ms 高频触发，跳过高频成功日志，仅在发生异常时记录 ERROR
     try {
       return await this.invokeCmd<RayHitResult>(
         'cmd_pick_tin_ray',
@@ -548,7 +584,7 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async flipTinEdge(
-    slot: SurfaceSlot,
+    slot: SlotId,
     triangleId: number,
     edgeSlot: number,
     forceFlip: boolean
@@ -562,7 +598,7 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async modifyVertexElevation(
-    slot: SurfaceSlot,
+    slot: SlotId,
     vertexId: number,
     newLocalZ: number
   ): Promise<void> {
@@ -574,7 +610,7 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async insertVertex(
-    slot: SurfaceSlot,
+    slot: SlotId,
     localXyz: [number, number, number],
     codeId: number
   ): Promise<number> {
@@ -586,7 +622,7 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async insertBreakline(
-    slot: SurfaceSlot,
+    slot: SlotId,
     polyline: Array<[number, number, number]>,
     codeId: number,
     interpolateZFromTin: boolean
@@ -599,8 +635,12 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
     });
   }
 
+  async deleteVertex(slot: SlotId, vertexId: number): Promise<void> {
+    await this.invokeCmd<void>('cmd_tin_delete_vertex', { slot, vertexId });
+  }
+
   async clipByPolygon(
-    slot: SurfaceSlot,
+    slot: SlotId,
     polygon: Array<[number, number, number]>,
     keepInside: boolean
   ): Promise<void> {
@@ -611,23 +651,24 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
     });
   }
 
-  async undoTin(slot: SurfaceSlot): Promise<void> {
+  async undoTin(slot: SlotId): Promise<void> {
     await this.invokeCmd<void>('cmd_tin_undo', { slot });
   }
 
-  async redoTin(slot: SurfaceSlot): Promise<void> {
+  async redoTin(slot: SlotId): Promise<void> {
     await this.invokeCmd<void>('cmd_tin_redo', { slot });
   }
 
-  async getHistoryState(slot: SurfaceSlot): Promise<{ canUndo: boolean; canRedo: boolean }> {
-    return this.invokeCmd<{ canUndo: boolean; canRedo: boolean }>('cmd_tin_get_history_state', {
-      slot,
-    });
+  async getHistoryState(slot: SlotId): Promise<{ canUndo: boolean; canRedo: boolean }> {
+    return this.invokeCmd<{ canUndo: boolean; canRedo: boolean }>(
+      'cmd_tin_get_history_state',
+      { slot }
+    );
   }
 
   async computeEarthworkExact(
-    period1Slot: SurfaceSlot,
-    period2Slot: SurfaceSlot,
+    period1Slot: SlotId,
+    period2Slot: SlotId,
     roiPolygon?: Array<[number, number, number]>
   ): Promise<EarthworkSummary> {
     return this.invokeCmd<EarthworkSummary>('cmd_compute_earthwork_exact', {
@@ -638,8 +679,8 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async computeEarthworkGrid(
-    period1Slot: SurfaceSlot,
-    period2Slot: SurfaceSlot,
+    period1Slot: SlotId,
+    period2Slot: SlotId,
     gridStep: number,
     roiPolygon?: Array<[number, number, number]>
   ): Promise<EarthworkSummary> {
@@ -652,7 +693,7 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
   }
 
   async computeSlopeGrading(
-    originalSlot: SurfaceSlot,
+    originalSlot: SlotId,
     basePolygon: Array<[number, number, number]>,
     stages: SlopeStageSpec[],
     params: GradingParams,
@@ -672,7 +713,7 @@ export class TauriNativeKernelBridge implements IGeoKernelBridge {
 // 实现 2：Web HTTP/Binary 远程计算服务器桥接器（便于无缝迁移至云端 SaaS 模式）
 // ==============================================================================
 export class HttpBinaryKernelBridge implements IGeoKernelBridge {
-  readonly backendName = 'Web Remote C++20 Compute Server';
+  readonly backendName = 'Web Remote C++20 Multi-Period Compute Server';
   private readonly baseUrl: string;
 
   constructor(baseUrl = '/api/geokernel') {
@@ -685,7 +726,7 @@ export class HttpBinaryKernelBridge implements IGeoKernelBridge {
   }
 
   async writeDebugLog(_level: LogLevel, _module: string, _message: string): Promise<void> {
-    // 浏览器远程模式已由 FrontendDebugLogger 输出至控制台，此处无需额外远程请求
+    // 浏览器模式下已输出至开发者控制台，此处无需额外远程请求
   }
 
   private async postJson<T>(endpoint: string, body: unknown): Promise<T> {
@@ -698,7 +739,10 @@ export class HttpBinaryKernelBridge implements IGeoKernelBridge {
     });
     if (!resp.ok) {
       const errText = await resp.text();
-      frontendLogger.error('HTTP', () => `POST ${endpoint} 返回异常状态 ${resp.status}: ${errText}`);
+      frontendLogger.error(
+        'HTTP',
+        () => `POST ${endpoint} 返回异常状态 ${resp.status}: ${errText}`
+      );
       throw new Error(errText);
     }
     const data = (await resp.json()) as T;
@@ -709,29 +753,75 @@ export class HttpBinaryKernelBridge implements IGeoKernelBridge {
     return data;
   }
 
-  async pickDatFileDialog(title: string): Promise<string | null> {
-    const path = window.prompt(`${title} — 请输入服务器侧 .dat 文件路径:`);
-    return path && path.trim().length > 0 ? path.trim() : null;
+  async pickDatFilesDialog(title: string, allowMultiple = true): Promise<string[]> {
+    const hint = allowMultiple
+      ? `${title} — 请输入服务器侧 .dat 文件路径（多个路径用分号 ; 分隔）:`
+      : `${title} — 请输入服务器侧 .dat 文件路径:`;
+    const raw = window.prompt(hint);
+    if (!raw) return [];
+    return raw
+      .split(';')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
   }
 
-  async loadDatFile(slot: SurfaceSlot, filePath: string, coordOrder: 0 | 1): Promise<DatSummary> {
+  async pickDatFileDialog(title: string): Promise<string | null> {
+    const list = await this.pickDatFilesDialog(title, false);
+    return list.length > 0 ? list[0] : null;
+  }
+
+  async createPeriodSlot(): Promise<SlotId> {
+    return this.postJson<SlotId>('/periods/create', {});
+  }
+
+  async removePeriodSlot(slot: SlotId): Promise<void> {
+    await this.postJson<void>('/periods/remove', { slot });
+  }
+
+  async clearAllPeriods(): Promise<void> {
+    await this.postJson<void>('/periods/clear', {});
+  }
+
+  async listPeriodSlots(): Promise<SlotId[]> {
+    return this.postJson<SlotId[]>('/periods/list', {});
+  }
+
+  async loadDatFile(slot: SlotId, filePath: string, coordOrder: 0 | 1): Promise<DatSummary> {
     return this.postJson<DatSummary>('/load_dat', { slot, filePath, coordOrder });
   }
 
-  async buildOctree(slot: SurfaceSlot): Promise<OctreeSummary> {
+  async buildOctree(slot: SlotId): Promise<OctreeSummary> {
     return this.postJson<OctreeSummary>('/build_octree', { slot });
   }
 
-  async buildTin(slot: SurfaceSlot, decimationGridSize: number, tileSize: number): Promise<TinSummary> {
-    return this.postJson<TinSummary>('/build_tin', { slot, decimationGridSize, tileSize });
+  async buildTin(
+    slot: SlotId,
+    decimationGridSize: number,
+    tileSize: number,
+    maxEdgeLength = 0
+  ): Promise<TinSummary> {
+    return this.postJson<TinSummary>('/build_tin', {
+      slot,
+      decimationGridSize,
+      tileSize,
+      maxEdgeLength,
+    });
   }
 
-  async queryVisibleOctreeNodes(slot: SurfaceSlot, query: CameraQueryInput): Promise<VisibleOctreeNodesResult> {
+  async queryVisibleOctreeNodes(
+    slot: SlotId,
+    query: CameraQueryInput
+  ): Promise<VisibleOctreeNodesResult> {
     return this.postJson<VisibleOctreeNodesResult>('/octree/visible', { slot, query });
   }
 
-  async fetchOctreeNodePacket(slot: SurfaceSlot, nodeId: number): Promise<DecodedPointCloudPacket> {
-    const resp = await fetch(`${this.baseUrl}/octree/packet/${slot}/${nodeId}`);
+  async fetchOctreeNodePacket(
+    slot: SlotId,
+    nodeId: number
+  ): Promise<DecodedPointCloudPacket> {
+    const resp = await fetch(`${this.baseUrl}/octree/packet/${slot}/${nodeId}`, {
+      cache: 'no-store',
+    });
     if (!resp.ok) {
       const errText = await resp.text();
       frontendLogger.error('HTTP', () => `拉取八叉树节点 #${nodeId} 失败: ${errText}`);
@@ -740,12 +830,19 @@ export class HttpBinaryKernelBridge implements IGeoKernelBridge {
     return decodePointCloudPacket(await resp.arrayBuffer());
   }
 
-  async getDirtyTinTiles(slot: SurfaceSlot): Promise<number[]> {
+  async getDirtyTinTiles(slot: SlotId): Promise<number[]> {
     return this.postJson<number[]>('/tin/dirty_tiles', { slot });
   }
 
-  async fetchTinTilePacket(slot: SurfaceSlot, tileIndex: number, clearDirtyFlag: boolean): Promise<DecodedTinMeshPacket> {
-    const resp = await fetch(`${this.baseUrl}/tin/packet/${slot}/${tileIndex}?clear=${clearDirtyFlag ? 1 : 0}`);
+  async fetchTinTilePacket(
+    slot: SlotId,
+    tileIndex: number,
+    clearDirtyFlag: boolean
+  ): Promise<DecodedTinMeshPacket> {
+    const resp = await fetch(
+      `${this.baseUrl}/tin/packet/${slot}/${tileIndex}?clear=${clearDirtyFlag ? 1 : 0}`,
+      { cache: 'no-store' }
+    );
     if (!resp.ok) {
       const errText = await resp.text();
       frontendLogger.error('HTTP', () => `拉取三角网瓦片 #${tileIndex} 失败: ${errText}`);
@@ -754,66 +851,148 @@ export class HttpBinaryKernelBridge implements IGeoKernelBridge {
     return decodeTinMeshPacket(await resp.arrayBuffer());
   }
 
-  async queryElevationAt(slot: SurfaceSlot, localX: number, localY: number): Promise<{ localZ: number; globalZ: number } | null> {
-    return this.postJson<{ localZ: number; globalZ: number } | null>('/tin/elevation', { slot, localX, localY });
+  async queryElevationAt(
+    slot: SlotId,
+    localX: number,
+    localY: number
+  ): Promise<ElevationQueryResult | null> {
+    return this.postJson<ElevationQueryResult | null>('/tin/elevation', {
+      slot,
+      localX,
+      localY,
+    });
   }
 
-  async pickTinByRay(slot: SurfaceSlot, rayOrigin: [number, number, number], rayDir: [number, number, number]): Promise<RayHitResult> {
+  async pickTinByRay(
+    slot: SlotId,
+    rayOrigin: [number, number, number],
+    rayDir: [number, number, number]
+  ): Promise<RayHitResult> {
     return this.postJson<RayHitResult>('/tin/pick', { slot, rayOrigin, rayDir });
   }
 
-  async flipTinEdge(slot: SurfaceSlot, triangleId: number, edgeSlot: number, forceFlip: boolean): Promise<void> {
-    await this.postJson<void>('/tin/flip_edge', { slot, triangleId, edgeSlot, forceFlip });
+  async flipTinEdge(
+    slot: SlotId,
+    triangleId: number,
+    edgeSlot: number,
+    forceFlip: boolean
+  ): Promise<void> {
+    await this.postJson<void>('/tin/flip_edge', {
+      slot,
+      triangleId,
+      edgeSlot,
+      forceFlip,
+    });
   }
 
-  async modifyVertexElevation(slot: SurfaceSlot, vertexId: number, newLocalZ: number): Promise<void> {
+  async modifyVertexElevation(
+    slot: SlotId,
+    vertexId: number,
+    newLocalZ: number
+  ): Promise<void> {
     await this.postJson<void>('/tin/modify_z', { slot, vertexId, newLocalZ });
   }
 
-  async insertVertex(slot: SurfaceSlot, localXyz: [number, number, number], codeId: number): Promise<number> {
+  async insertVertex(
+    slot: SlotId,
+    localXyz: [number, number, number],
+    codeId: number
+  ): Promise<number> {
     return this.postJson<number>('/tin/insert_vertex', { slot, localXyz, codeId });
   }
 
-  async insertBreakline(slot: SurfaceSlot, polyline: Array<[number, number, number]>, codeId: number, interpolateZFromTin: boolean): Promise<void> {
-    await this.postJson<void>('/tin/insert_breakline', { slot, polyline, codeId, interpolateZFromTin });
+  async insertBreakline(
+    slot: SlotId,
+    polyline: Array<[number, number, number]>,
+    codeId: number,
+    interpolateZFromTin: boolean
+  ): Promise<void> {
+    await this.postJson<void>('/tin/insert_breakline', {
+      slot,
+      polyline,
+      codeId,
+      interpolateZFromTin,
+    });
   }
 
-  async clipByPolygon(slot: SurfaceSlot, polygon: Array<[number, number, number]>, keepInside: boolean): Promise<void> {
+  async deleteVertex(slot: SlotId, vertexId: number): Promise<void> {
+    await this.postJson<void>('/tin/delete_vertex', { slot, vertexId });
+  }
+
+  async clipByPolygon(
+    slot: SlotId,
+    polygon: Array<[number, number, number]>,
+    keepInside: boolean
+  ): Promise<void> {
     await this.postJson<void>('/tin/clip_polygon', { slot, polygon, keepInside });
   }
 
-  async undoTin(slot: SurfaceSlot): Promise<void> {
+  async undoTin(slot: SlotId): Promise<void> {
     await this.postJson<void>('/tin/undo', { slot });
   }
 
-  async redoTin(slot: SurfaceSlot): Promise<void> {
+  async redoTin(slot: SlotId): Promise<void> {
     await this.postJson<void>('/tin/redo', { slot });
   }
 
-  async getHistoryState(slot: SurfaceSlot): Promise<{ canUndo: boolean; canRedo: boolean }> {
+  async getHistoryState(slot: SlotId): Promise<{ canUndo: boolean; canRedo: boolean }> {
     return this.postJson<{ canUndo: boolean; canRedo: boolean }>('/tin/history', { slot });
   }
 
-  async computeEarthworkExact(period1Slot: SurfaceSlot, period2Slot: SurfaceSlot, roiPolygon?: Array<[number, number, number]>): Promise<EarthworkSummary> {
-    return this.postJson<EarthworkSummary>('/earthwork/exact', { period1Slot, period2Slot, roiPolygon: roiPolygon ?? [] });
+  async computeEarthworkExact(
+    period1Slot: SlotId,
+    period2Slot: SlotId,
+    roiPolygon?: Array<[number, number, number]>
+  ): Promise<EarthworkSummary> {
+    return this.postJson<EarthworkSummary>('/earthwork/exact', {
+      period1Slot,
+      period2Slot,
+      roiPolygon: roiPolygon ?? [],
+    });
   }
 
-  async computeEarthworkGrid(period1Slot: SurfaceSlot, period2Slot: SurfaceSlot, gridStep: number, roiPolygon?: Array<[number, number, number]>): Promise<EarthworkSummary> {
-    return this.postJson<EarthworkSummary>('/earthwork/grid', { period1Slot, period2Slot, gridStep, roiPolygon: roiPolygon ?? [] });
+  async computeEarthworkGrid(
+    period1Slot: SlotId,
+    period2Slot: SlotId,
+    gridStep: number,
+    roiPolygon?: Array<[number, number, number]>
+  ): Promise<EarthworkSummary> {
+    return this.postJson<EarthworkSummary>('/earthwork/grid', {
+      period1Slot,
+      period2Slot,
+      gridStep,
+      roiPolygon: roiPolygon ?? [],
+    });
   }
 
-  async computeSlopeGrading(originalSlot: SurfaceSlot, basePolygon: Array<[number, number, number]>, stages: SlopeStageSpec[], params: GradingParams, generateMergedTerrain: boolean): Promise<GradingSummary> {
-    return this.postJson<GradingSummary>('/grading/compute', { originalSlot, basePolygon, stages, params, generateMergedTerrain });
+  async computeSlopeGrading(
+    originalSlot: SlotId,
+    basePolygon: Array<[number, number, number]>,
+    stages: SlopeStageSpec[],
+    params: GradingParams,
+    generateMergedTerrain: boolean
+  ): Promise<GradingSummary> {
+    return this.postJson<GradingSummary>('/grading/compute', {
+      originalSlot,
+      basePolygon,
+      stages,
+      params,
+      generateMergedTerrain,
+    });
   }
 }
 
 /**
- * 自动探测运行环境并实例化最优通信桥接器
+ * 自动探测运行环境并实例化最优内核通信桥接器
  */
 export function createAutoKernelBridge(): IGeoKernelBridge {
   const win = window as unknown as Record<string, unknown>;
-  if (typeof win.__TAURI_INTERNALS__ !== 'undefined' || typeof win.__TAURI__ !== 'undefined') {
+  if (
+    typeof win.__TAURI_INTERNALS__ !== 'undefined' ||
+    typeof win.__TAURI__ !== 'undefined'
+  ) {
     return new TauriNativeKernelBridge();
   }
   return new HttpBinaryKernelBridge('/api/geokernel');
 }
+

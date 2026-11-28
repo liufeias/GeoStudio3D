@@ -1,13 +1,14 @@
 //! 空间几何内核 `GeoKernelCore` 动态库 FFI 安全封装层
 //!
-//! 设计规范：
+//! 设计与企业级健壮性规范：
 //!   1. 所有 `#[repr(C)]` 结构体与 `include/geo_kernel/geo_kernel_c_api.h` 严格逐字节对齐；
 //!   2. 严格同级目录加载策略：仅从当前桌面主程序（`geo-studio-3d.exe`）所在同级目录加载
 //!      `GeoKernelCore.dll`（Linux 为 `libGeoKernelCore.so`，macOS 为 `libGeoKernelCore.dylib`），
-//!      禁止跨目录猜测路径；
-//!   3. 支持将 C++20 内核的结构化日志回调（`geo_set_log_callback`）安全桥接至 Rust 主日志系统，
-//!      消除双端各自操作控制台/日志文件导致的 UCRT 断言风险；
-//!   4. 暴露线程安全的 `SafeGeoProject` 句柄包装，析构时自动调用 `geo_project_destroy` 释放全部 C++ 内存。
+//!      绝不跨目录盲目搜寻；
+//!   3. 完整绑定任意期数动态槽位管理接口（创建期数槽位、移除期数槽位、清空全部期数、枚举活跃槽位、
+//!      获取统一工程主 RTC 原点）以及全套点云、八叉树、三角网、拓扑编辑、土方与放坡 C ABI；
+//!   4. 暴露线程安全的 `SafeGeoProject` RAII 句柄包装，析构时自动调用 `geo_project_destroy`
+//!      回收全部 C++20 原生内存。
 
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -195,13 +196,21 @@ pub type GeoLogCallback = Option<
     ),
 >;
 
-/// 动态加载的 C++20 几何内核函数表
+/// 动态加载的 C++20 空间几何内核完整函数指针表
 pub struct GeoKernelLib {
     _lib: Library,
     pub geo_get_last_error: unsafe extern "C" fn() -> *const c_char,
     pub geo_set_log_callback: Option<unsafe extern "C" fn(GeoLogCallback, *mut c_void)>,
     pub geo_project_create: unsafe extern "C" fn() -> GeoProjectHandle,
     pub geo_project_destroy: unsafe extern "C" fn(GeoProjectHandle),
+    pub geo_project_create_period_slot:
+        unsafe extern "C" fn(GeoProjectHandle, *mut i32) -> GeoStatus,
+    pub geo_project_remove_slot: unsafe extern "C" fn(GeoProjectHandle, i32) -> GeoStatus,
+    pub geo_project_clear_all_periods: unsafe extern "C" fn(GeoProjectHandle) -> GeoStatus,
+    pub geo_project_list_slots:
+        unsafe extern "C" fn(GeoProjectHandle, *mut i32, u32, *mut u32) -> GeoStatus,
+    pub geo_project_get_master_rtc:
+        unsafe extern "C" fn(GeoProjectHandle, *mut f64, *mut bool) -> GeoStatus,
     pub geo_default_dat_load_params: unsafe extern "C" fn() -> GeoDatLoadParams,
     pub geo_project_load_dat: unsafe extern "C" fn(
         GeoProjectHandle,
@@ -273,6 +282,8 @@ pub struct GeoKernelLib {
         unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u16, bool, *mut u32) -> GeoStatus,
     pub geo_project_tin_insert_breakline:
         unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u32, u16, bool) -> GeoStatus,
+    pub geo_project_tin_delete_vertex:
+        unsafe extern "C" fn(GeoProjectHandle, i32, u32) -> GeoStatus,
     pub geo_project_tin_clip_polygon:
         unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u32, bool) -> GeoStatus,
     pub geo_project_tin_undo: unsafe extern "C" fn(GeoProjectHandle, i32) -> GeoStatus,
@@ -314,7 +325,7 @@ pub struct GeoKernelLib {
 }
 
 impl GeoKernelLib {
-    /// 严格从当前可执行文件所在同级目录加载 `GeoKernelCore` 动态链接库（禁止跨目录猜测）
+    /// 严格从当前主程序所在同级目录加载 `GeoKernelCore` 核心动态链接库
     pub fn load_auto<F>(mut log_fn: F) -> Result<Self, String>
     where
         F: FnMut(&str),
@@ -332,7 +343,6 @@ impl GeoKernelLib {
             .parent()
             .ok_or_else(|| "无法解析当前主程序所在父目录".to_string())?;
 
-        // 唯一合法加载路径：与主程序严格位于同一目录下的动态链接库
         let exact_dll_path = exe_dir.join(lib_name);
         log_fn(&format!(
             "正在检测核心几何内核动态库: {}",
@@ -356,7 +366,7 @@ impl GeoKernelLib {
             )
         })?;
 
-        log_fn("核心动态库装载成功，开始绑定全部 C ABI 符号...");
+        log_fn("核心动态库装载成功，开始绑定全部多期 C ABI 符号...");
         let bound = unsafe { Self::bind_symbols(lib)? };
         log_fn("C++20 核心动态库全部 ABI 符号绑定完成");
         Ok(bound)
@@ -378,36 +388,116 @@ impl GeoKernelLib {
             .map(|s| *s);
 
         Ok(Self {
-            geo_get_last_error: load_sym!(geo_get_last_error, unsafe extern "C" fn() -> *const c_char),
+            geo_get_last_error: load_sym!(
+                geo_get_last_error,
+                unsafe extern "C" fn() -> *const c_char
+            ),
             geo_set_log_callback: log_cb_sym,
-            geo_project_create: load_sym!(geo_project_create, unsafe extern "C" fn() -> GeoProjectHandle),
-            geo_project_destroy: load_sym!(geo_project_destroy, unsafe extern "C" fn(GeoProjectHandle)),
-            geo_default_dat_load_params: load_sym!(geo_default_dat_load_params, unsafe extern "C" fn() -> GeoDatLoadParams),
+            geo_project_create: load_sym!(
+                geo_project_create,
+                unsafe extern "C" fn() -> GeoProjectHandle
+            ),
+            geo_project_destroy: load_sym!(
+                geo_project_destroy,
+                unsafe extern "C" fn(GeoProjectHandle)
+            ),
+            geo_project_create_period_slot: load_sym!(
+                geo_project_create_period_slot,
+                unsafe extern "C" fn(GeoProjectHandle, *mut i32) -> GeoStatus
+            ),
+            geo_project_remove_slot: load_sym!(
+                geo_project_remove_slot,
+                unsafe extern "C" fn(GeoProjectHandle, i32) -> GeoStatus
+            ),
+            geo_project_clear_all_periods: load_sym!(
+                geo_project_clear_all_periods,
+                unsafe extern "C" fn(GeoProjectHandle) -> GeoStatus
+            ),
+            geo_project_list_slots: load_sym!(
+                geo_project_list_slots,
+                unsafe extern "C" fn(GeoProjectHandle, *mut i32, u32, *mut u32) -> GeoStatus
+            ),
+            geo_project_get_master_rtc: load_sym!(
+                geo_project_get_master_rtc,
+                unsafe extern "C" fn(GeoProjectHandle, *mut f64, *mut bool) -> GeoStatus
+            ),
+            geo_default_dat_load_params: load_sym!(
+                geo_default_dat_load_params,
+                unsafe extern "C" fn() -> GeoDatLoadParams
+            ),
             geo_project_load_dat: load_sym!(
                 geo_project_load_dat,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const c_char, *const GeoDatLoadParams, GeoProgressCallback, *mut c_void, *mut GeoDatSummary) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const c_char,
+                    *const GeoDatLoadParams,
+                    GeoProgressCallback,
+                    *mut c_void,
+                    *mut GeoDatSummary,
+                ) -> GeoStatus
             ),
-            geo_default_octree_params: load_sym!(geo_default_octree_params, unsafe extern "C" fn() -> GeoOctreeParams),
+            geo_default_octree_params: load_sym!(
+                geo_default_octree_params,
+                unsafe extern "C" fn() -> GeoOctreeParams
+            ),
             geo_project_build_octree: load_sym!(
                 geo_project_build_octree,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const GeoOctreeParams, *mut GeoOctreeSummary) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const GeoOctreeParams,
+                    *mut GeoOctreeSummary,
+                ) -> GeoStatus
             ),
             geo_project_query_visible_octree_nodes: load_sym!(
                 geo_project_query_visible_octree_nodes,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const GeoCameraQuery, *mut u32, u32, *mut u32, *mut u64) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const GeoCameraQuery,
+                    *mut u32,
+                    u32,
+                    *mut u32,
+                    *mut u64,
+                ) -> GeoStatus
             ),
             geo_project_fetch_octree_node_gpu_packet: load_sym!(
                 geo_project_fetch_octree_node_gpu_packet,
-                unsafe extern "C" fn(GeoProjectHandle, i32, u32, *mut u8, usize, *mut usize) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    u32,
+                    *mut u8,
+                    usize,
+                    *mut usize,
+                ) -> GeoStatus
             ),
-            geo_default_tin_params: load_sym!(geo_default_tin_params, unsafe extern "C" fn() -> GeoTinParams),
+            geo_default_tin_params: load_sym!(
+                geo_default_tin_params,
+                unsafe extern "C" fn() -> GeoTinParams
+            ),
             geo_project_build_tin: load_sym!(
                 geo_project_build_tin,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const GeoTinParams, GeoProgressCallback, *mut c_void, *mut GeoTinSummary) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const GeoTinParams,
+                    GeoProgressCallback,
+                    *mut c_void,
+                    *mut GeoTinSummary,
+                ) -> GeoStatus
             ),
             geo_project_query_elevation: load_sym!(
                 geo_project_query_elevation,
-                unsafe extern "C" fn(GeoProjectHandle, i32, f64, f64, *mut f64, *mut f64) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    f64,
+                    f64,
+                    *mut f64,
+                    *mut f64,
+                ) -> GeoStatus
             ),
             geo_project_get_dirty_tin_tiles: load_sym!(
                 geo_project_get_dirty_tin_tiles,
@@ -415,11 +505,25 @@ impl GeoKernelLib {
             ),
             geo_project_fetch_tin_tile_gpu_packet: load_sym!(
                 geo_project_fetch_tin_tile_gpu_packet,
-                unsafe extern "C" fn(GeoProjectHandle, i32, u32, bool, *mut u8, usize, *mut usize) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    u32,
+                    bool,
+                    *mut u8,
+                    usize,
+                    *mut usize,
+                ) -> GeoStatus
             ),
             geo_project_pick_tin_ray: load_sym!(
                 geo_project_pick_tin_ray,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, *const f64, *mut GeoRayHitResult) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const f64,
+                    *const f64,
+                    *mut GeoRayHitResult,
+                ) -> GeoStatus
             ),
             geo_project_tin_flip_edge: load_sym!(
                 geo_project_tin_flip_edge,
@@ -431,11 +535,29 @@ impl GeoKernelLib {
             ),
             geo_project_tin_insert_vertex: load_sym!(
                 geo_project_tin_insert_vertex,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u16, bool, *mut u32) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const f64,
+                    u16,
+                    bool,
+                    *mut u32,
+                ) -> GeoStatus
             ),
             geo_project_tin_insert_breakline: load_sym!(
                 geo_project_tin_insert_breakline,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u32, u16, bool) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const f64,
+                    u32,
+                    u16,
+                    bool,
+                ) -> GeoStatus
+            ),
+            geo_project_tin_delete_vertex: load_sym!(
+                geo_project_tin_delete_vertex,
+                unsafe extern "C" fn(GeoProjectHandle, i32, u32) -> GeoStatus
             ),
             geo_project_tin_clip_polygon: load_sym!(
                 geo_project_tin_clip_polygon,
@@ -455,15 +577,44 @@ impl GeoKernelLib {
             ),
             geo_project_compute_earthwork_exact: load_sym!(
                 geo_project_compute_earthwork_exact,
-                unsafe extern "C" fn(GeoProjectHandle, i32, i32, *const f64, u32, u32, *mut GeoEarthworkSummary) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    i32,
+                    *const f64,
+                    u32,
+                    u32,
+                    *mut GeoEarthworkSummary,
+                ) -> GeoStatus
             ),
             geo_project_compute_earthwork_grid: load_sym!(
                 geo_project_compute_earthwork_grid,
-                unsafe extern "C" fn(GeoProjectHandle, i32, i32, f64, *const f64, u32, u32, *mut GeoEarthworkSummary) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    i32,
+                    f64,
+                    *const f64,
+                    u32,
+                    u32,
+                    *mut GeoEarthworkSummary,
+                ) -> GeoStatus
             ),
             geo_project_compute_slope_grading: load_sym!(
                 geo_project_compute_slope_grading,
-                unsafe extern "C" fn(GeoProjectHandle, i32, *const f64, u32, *const GeoSlopeStageSpec, u32, *const GeoGradingParams, bool, *mut f64, u32, *mut GeoGradingSummary) -> GeoStatus
+                unsafe extern "C" fn(
+                    GeoProjectHandle,
+                    i32,
+                    *const f64,
+                    u32,
+                    *const GeoSlopeStageSpec,
+                    u32,
+                    *const GeoGradingParams,
+                    bool,
+                    *mut f64,
+                    u32,
+                    *mut GeoGradingSummary,
+                ) -> GeoStatus
             ),
             _lib: lib,
         })
@@ -514,6 +665,49 @@ impl SafeGeoProject {
         Ok(Self { lib, handle })
     }
 
+    /// 申请一个新的动态测绘期数槽位号
+    pub fn create_period_slot(&self) -> Result<i32, String> {
+        let mut slot_id: i32 = -1;
+        let st = unsafe { (self.lib.geo_project_create_period_slot)(self.handle, &mut slot_id) };
+        self.lib.check_status(st)?;
+        Ok(slot_id)
+    }
+
+    /// 卸载并释放指定期数槽位的全部内存资源
+    pub fn remove_slot(&self, slot: i32) -> Result<(), String> {
+        let st = unsafe { (self.lib.geo_project_remove_slot)(self.handle, slot) };
+        self.lib.check_status(st)
+    }
+
+    /// 清空全部期数与派生数据
+    pub fn clear_all_periods(&self) -> Result<(), String> {
+        let st = unsafe { (self.lib.geo_project_clear_all_periods)(self.handle) };
+        self.lib.check_status(st)
+    }
+
+    /// 枚举当前所有活跃槽位号
+    pub fn list_slots(&self) -> Result<Vec<i32>, String> {
+        let mut count: u32 = 0;
+        let st1 = unsafe {
+            (self.lib.geo_project_list_slots)(self.handle, ptr::null_mut(), 0, &mut count)
+        };
+        self.lib.check_status(st1)?;
+        let mut ids = vec![0i32; count as usize];
+        if count > 0 {
+            let st2 = unsafe {
+                (self.lib.geo_project_list_slots)(
+                    self.handle,
+                    ids.as_mut_ptr(),
+                    count,
+                    &mut count,
+                )
+            };
+            self.lib.check_status(st2)?;
+        }
+        Ok(ids)
+    }
+
+    /// 导入指定期数的 .dat 点云文件并自动对齐至工程主 RTC 原点
     pub fn load_dat(
         &self,
         slot: i32,
@@ -524,7 +718,6 @@ impl SafeGeoProject {
         let mut params = unsafe { (self.lib.geo_default_dat_load_params)() };
         params.coord_order = coord_order;
         let mut summary = GeoDatSummary::default();
-
         let st = unsafe {
             (self.lib.geo_project_load_dat)(
                 self.handle,
@@ -540,6 +733,7 @@ impl SafeGeoProject {
         Ok(summary)
     }
 
+    /// 零拷贝两段式拉取八叉树点云节点 GPU 二进制数据包
     pub fn fetch_octree_packet(&self, slot: i32, node_id: u32) -> Result<Vec<u8>, String> {
         let mut byte_size: usize = 0;
         let st1 = unsafe {
@@ -553,7 +747,6 @@ impl SafeGeoProject {
             )
         };
         self.lib.check_status(st1)?;
-
         let mut buf = vec![0u8; byte_size];
         if byte_size > 0 {
             let st2 = unsafe {
@@ -571,6 +764,7 @@ impl SafeGeoProject {
         Ok(buf)
     }
 
+    /// 零拷贝两段式拉取三角网空间瓦片 GPU 二进制网格包
     pub fn fetch_tin_tile_packet(
         &self,
         slot: i32,
@@ -590,7 +784,6 @@ impl SafeGeoProject {
             )
         };
         self.lib.check_status(st1)?;
-
         let mut buf = vec![0u8; byte_size];
         if byte_size > 0 {
             let st2 = unsafe {
